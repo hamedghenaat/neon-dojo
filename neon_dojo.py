@@ -30,7 +30,7 @@ MIN_HEIGHT = 23
 SPRITE_WIDTH = 17
 GAME_PORT = 48765
 DISCOVERY_PORT = 48766
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 MENU_ITEMS = ("SINGLE PLAYER", "ADD SERVER", "JOIN SERVER")
 SETUP_VERSION = 1
 MIN_PYTHON = (3, 10)
@@ -69,14 +69,17 @@ def _unicode_ready() -> tuple[bool, str]:
 
 
 def _udp_ready() -> tuple[bool, str]:
-    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    tcp_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        probe.bind(("127.0.0.1", 0))
-        return True, "UDP networking available"
+        udp_probe.bind(("127.0.0.1", 0))
+        tcp_probe.bind(("127.0.0.1", 0))
+        return True, "TCP/UDP networking available"
     except OSError as error:
-        return False, f"UDP socket unavailable: {error}"
+        return False, f"Network socket unavailable: {error}"
     finally:
-        probe.close()
+        udp_probe.close()
+        tcp_probe.close()
 
 
 def dependency_checks() -> list[DependencyResult]:
@@ -117,7 +120,7 @@ def dependency_checks() -> list[DependencyResult]:
             "Multiplayer networking",
             udp_ready,
             udp_detail,
-            "Allow Python UDP access in your firewall, then run the game again",
+            "Allow Python TCP/UDP access in your firewall, then run the game again",
         ),
     ]
 
@@ -611,135 +614,277 @@ def parse_server_address(value: str) -> tuple[str, int]:
 
 
 class NetworkSession:
-    """Non-blocking UDP discovery and host-authoritative game transport."""
+    """UDP discovery with a reliable TCP gameplay connection.
+
+    Both roles listen on the gameplay port. Usually the joining player connects
+    to the host. On asymmetric networks the host can instead connect outward to
+    the waiting player with ``invite_player``.
+    """
 
     def __init__(self, role: str) -> None:
         self.role = role
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        if role == "host":
-            self.sock.bind(("0.0.0.0", GAME_PORT))
-        else:
-            self.sock.bind(("0.0.0.0", DISCOVERY_PORT))
-        self.sock.setblocking(False)
         self.peer: tuple[str, int] | None = None
         self.last_send = 0.0
         self.last_seen = time.monotonic()
         self.session_id = f"{random.getrandbits(48):012x}"
         self.connected = False
+        self.connection: socket.socket | None = None
+        self.connection_lost = False
+        self.receive_buffer = bytearray()
+        self.send_buffer = bytearray()
 
-    def _send(self, payload: dict[str, object], address: tuple[str, int]) -> None:
+        self.discovery = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.discovery.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.discovery.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        if role == "client":
+            self.discovery.bind(("0.0.0.0", DISCOVERY_PORT))
+        self.discovery.setblocking(False)
+
+        self.listener: socket.socket | None = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self.listener.bind(("0.0.0.0", GAME_PORT))
+            self.listener.listen(2)
+            self.listener.setblocking(False)
+        except OSError:
+            self.listener.close()
+            self.listener = None
+            if role == "host":
+                self.discovery.close()
+                raise
+
+    def _send_discovery(self, payload: dict[str, object], address: tuple[str, int]) -> None:
         try:
             encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-            self.sock.sendto(encoded, address)
+            self.discovery.sendto(encoded, address)
         except (OSError, TypeError, ValueError):
             pass
 
-    def connect_direct(self, value: str) -> str:
-        self.peer = parse_server_address(value)
+    def _queue(self, payload: dict[str, object]) -> None:
+        if self.connection is None:
+            return
+        try:
+            packet = json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n"
+        except (TypeError, ValueError):
+            return
+        if len(self.send_buffer) > 262_144 and payload.get("t") == "state":
+            self.send_buffer.clear()
+        self.send_buffer.extend(packet)
+        self._flush()
+
+    def _flush(self) -> None:
+        if self.connection is None or not self.send_buffer:
+            return
+        try:
+            sent = self.connection.send(self.send_buffer)
+            del self.send_buffer[:sent]
+        except BlockingIOError:
+            pass
+        except OSError:
+            self.connection_lost = True
+            self._drop_connection()
+
+    def _set_connection(self, connection: socket.socket, address: tuple[str, int]) -> None:
+        connection.setblocking(False)
+        connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.connection = connection
+        self.peer = address
+        self.receive_buffer.clear()
+        self.send_buffer.clear()
+        self.connected = False
+        self.last_seen = time.monotonic()
         self.last_send = 0.0
-        self._send({"v": PROTOCOL_VERSION, "t": "join"}, self.peer)
-        return f"Connecting to {self.peer[0]}:{self.peer[1]}"
+
+    def _connect(self, address: tuple[str, int]) -> None:
+        if self.connection is not None:
+            self._drop_connection()
+        self.connection_lost = False
+        connection = socket.create_connection(address, timeout=1.5)
+        self._set_connection(connection, address)
+
+    def connect_direct(self, value: str) -> str:
+        if self.role != "client":
+            raise ValueError("only a joining player can connect to a server")
+        address = parse_server_address(value)
+        self._connect(address)
+        self._queue({"v": PROTOCOL_VERSION, "t": "join"})
+        return f"Connecting to {address[0]}:{address[1]}"
+
+    def invite_player(self, value: str) -> str:
+        if self.role != "host":
+            raise ValueError("only a host can invite a waiting player")
+        address = parse_server_address(value)
+        self._connect(address)
+        return f"Inviting player at {address[0]}:{address[1]}"
 
     def send_command(self, command: str) -> None:
-        if self.role == "client" and self.peer:
-            self._send({"v": PROTOCOL_VERSION, "t": "input", "key": command}, self.peer)
+        if self.role == "client" and self.connection:
+            self._queue({"v": PROTOCOL_VERSION, "t": "input", "key": command})
 
-    def poll(self, game: Game) -> list[str]:
-        events: list[str] = []
+    def _accept_connections(self, events: list[str]) -> None:
+        if self.listener is None:
+            return
         while True:
             try:
-                packet, address = self.sock.recvfrom(65535)
+                connection, address = self.listener.accept()
+            except BlockingIOError:
+                break
+            except OSError:
+                break
+            if self.connection is not None:
+                try:
+                    connection.sendall(json.dumps({"v": PROTOCOL_VERSION, "t": "busy"}).encode() + b"\n")
+                except OSError:
+                    pass
+                connection.close()
+                continue
+            self._set_connection(connection, address)
+            if self.role == "client":
+                self._queue({"v": PROTOCOL_VERSION, "t": "join"})
+                events.append("found")
+
+    def _poll_discovery(self, events: list[str]) -> None:
+        if self.role != "client" or self.connection is not None:
+            return
+        while True:
+            try:
+                packet, address = self.discovery.recvfrom(8192)
             except BlockingIOError:
                 break
             except OSError:
                 break
             try:
                 data = json.loads(packet.decode("utf-8"))
+                port = int(data.get("port", GAME_PORT))
+            except (UnicodeDecodeError, json.JSONDecodeError, AttributeError, TypeError, ValueError):
+                continue
+            if data.get("v") != PROTOCOL_VERSION or data.get("t") != "announce" or not (1 <= port <= 65535):
+                continue
+            try:
+                self._connect((address[0], port))
+            except OSError:
+                continue
+            self._queue({"v": PROTOCOL_VERSION, "t": "join"})
+            events.append("found")
+            break
+
+    def _poll_stream(self, game: Game, events: list[str]) -> None:
+        if self.connection is None:
+            return
+        while True:
+            try:
+                packet = self.connection.recv(65536)
+            except BlockingIOError:
+                break
+            except OSError:
+                packet = b""
+            if not packet:
+                events.append("left")
+                self._drop_connection()
+                return
+            self.receive_buffer.extend(packet)
+            if len(self.receive_buffer) > 1_048_576:
+                events.append("left")
+                self._drop_connection()
+                return
+        while b"\n" in self.receive_buffer:
+            raw, _, remainder = self.receive_buffer.partition(b"\n")
+            self.receive_buffer = bytearray(remainder)
+            try:
+                data = json.loads(raw.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 continue
             if not isinstance(data, dict) or data.get("v") != PROTOCOL_VERSION:
                 continue
+            self.last_seen = time.monotonic()
             kind = data.get("t")
             if self.role == "host":
-                if kind == "join":
-                    if self.peer is None:
-                        self.peer = address
-                        self.connected = True
-                        self.last_seen = time.monotonic()
-                        events.append("joined")
-                    elif address != self.peer:
-                        self._send({"v": PROTOCOL_VERSION, "t": "busy"}, address)
-                elif address == self.peer:
-                    self.last_seen = time.monotonic()
-                    if kind == "input" and isinstance(data.get("key"), str):
-                        events.append(f"input:{data['key']}")
-                    elif kind == "leave":
-                        events.append("left")
+                if kind == "join" and not self.connected:
+                    self.connected = True
+                    events.append("joined")
+                elif kind == "input" and isinstance(data.get("key"), str):
+                    events.append(f"input:{data['key']}")
+                elif kind == "leave":
+                    events.append("left")
+                    self._drop_connection()
+                    return
             else:
-                if kind == "announce" and self.peer is None:
-                    try:
-                        port = int(data.get("port", GAME_PORT))
-                    except (TypeError, ValueError):
-                        continue
-                    if not (1 <= port <= 65535):
-                        continue
-                    self.peer = (address[0], port)
-                    self._send({"v": PROTOCOL_VERSION, "t": "join"}, self.peer)
-                    events.append("found")
-                elif self.peer and address[0] == self.peer[0] and kind == "state":
-                    if apply_game_data(game, data.get("game")):
-                        was_connected = self.connected
-                        self.connected = True
-                        self.last_seen = time.monotonic()
-                        if not was_connected:
-                            events.append("connected")
+                if kind == "state" and apply_game_data(game, data.get("game")):
+                    was_connected = self.connected
+                    self.connected = True
+                    if not was_connected:
+                        events.append("connected")
                 elif kind == "busy":
-                    self.peer = None
-                    self.connected = False
                     events.append("busy")
+                    self._drop_connection()
+                    return
+                elif kind == "leave":
+                    events.append("left")
+                    self._drop_connection()
+                    return
+
+    def poll(self, game: Game) -> list[str]:
+        events: list[str] = []
+        if self.connection_lost:
+            events.append("left")
+            self.connection_lost = False
+        self._accept_connections(events)
+        self._poll_discovery(events)
+        self._poll_stream(game, events)
+        self._flush()
         return events
 
     def tick(self, game: Game) -> list[str]:
         now = time.monotonic()
         events: list[str] = []
         if self.role == "host":
-            if self.peer is None and now - self.last_send >= 0.75:
+            if self.connection is None and now - self.last_send >= 0.75:
                 announcement = {
                     "v": PROTOCOL_VERSION,
                     "t": "announce",
                     "port": GAME_PORT,
                     "id": self.session_id,
                 }
-                self._send(announcement, ("255.255.255.255", DISCOVERY_PORT))
-                self._send(announcement, ("127.0.0.1", DISCOVERY_PORT))
+                self._send_discovery(announcement, ("255.255.255.255", DISCOVERY_PORT))
+                self._send_discovery(announcement, ("127.0.0.1", DISCOVERY_PORT))
                 self.last_send = now
-            elif self.peer and now - self.last_send >= 1 / 20:
-                self._send({"v": PROTOCOL_VERSION, "t": "state", "game": game_to_data(game)}, self.peer)
+            elif self.connected and now - self.last_send >= 1 / 20:
+                self._queue({"v": PROTOCOL_VERSION, "t": "state", "game": game_to_data(game)})
                 self.last_send = now
-            if self.peer and now - self.last_seen > 5.0:
-                events.append("timeout")
-        elif self.peer:
-            if now - self.last_send >= 0.5:
-                kind = "ping" if self.connected else "join"
-                self._send({"v": PROTOCOL_VERSION, "t": kind}, self.peer)
-                self.last_send = now
-            if self.connected and now - self.last_seen > 5.0:
-                events.append("timeout")
+        elif self.connection and now - self.last_send >= 0.5:
+            self._queue({"v": PROTOCOL_VERSION, "t": "ping"})
+            self.last_send = now
+        self._flush()
+        if self.connection and now - self.last_seen > 7.0:
+            events.append("timeout")
         return events
 
-    def close(self) -> None:
-        if self.peer:
-            self._send({"v": PROTOCOL_VERSION, "t": "leave"}, self.peer)
-        try:
-            self.sock.close()
-        except OSError:
-            pass
-
-    def reset_peer(self) -> None:
+    def _drop_connection(self) -> None:
+        if self.connection:
+            try:
+                self.connection.close()
+            except OSError:
+                pass
+        self.connection = None
         self.peer = None
         self.connected = False
+        self.receive_buffer.clear()
+        self.send_buffer.clear()
+
+    def close(self) -> None:
+        if self.connection:
+            self._queue({"v": PROTOCOL_VERSION, "t": "leave"})
+            self._flush()
+        self._drop_connection()
+        for sock in (self.listener, self.discovery):
+            if sock:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+    def reset_peer(self) -> None:
+        self._drop_connection()
         self.last_seen = time.monotonic()
         self.last_send = 0.0
 
@@ -1116,6 +1261,8 @@ class Renderer:
             safe_add(self.win, 9, (width - len(heading)) // 2, heading, self.c(7, True))
             safe_add(self.win, 11, (width - len(status)) // 2, status, self.c(1))
             safe_add(self.win, 13, (width - len(address)) // 2, address, self.c(4, True))
+            invite = "Press I to invite a routed player by IP"
+            safe_add(self.win, 14, (width - len(invite)) // 2, invite, self.c(4, True))
         else:
             dots = "." * (1 + (tick // 10) % 3)
             heading = "SCANNING FOR SERVERS" + dots
@@ -1239,6 +1386,8 @@ def handle_input(
                 app_command = "menu"
             elif game.state == "searching" and key in (ord("i"), ord("I")):
                 app_command = "direct"
+            elif game.state == "hosting" and key in (ord("i"), ord("I")):
+                app_command = "invite"
             continue
         if game.state == "match_over" and key in (10, 13, curses.KEY_ENTER) and role != "client":
             game.start_match(width)
@@ -1261,9 +1410,8 @@ def handle_input(
     return True, app_command, outgoing
 
 
-def prompt_server_address(win: curses.window) -> str:
+def prompt_server_address(win: curses.window, prompt: str = "Server IP or hostname[:port]: ") -> str:
     height, width = win.getmaxyx()
-    prompt = "Server IP or hostname[:port]: "
     y = min(height - 2, 19)
     win.nodelay(False)
     try:
@@ -1344,6 +1492,13 @@ def run(win: curses.window) -> None:
                         game.network_status = network.connect_direct(address)
                     except (OSError, ValueError) as error:
                         game.network_status = f"Address error: {error}"
+            elif app_command == "invite" and network and network.role == "host":
+                address = prompt_server_address(win, "Waiting player IP[:port]: ")
+                if address:
+                    try:
+                        game.network_status = network.invite_player(address)
+                    except (OSError, ValueError) as error:
+                        game.network_status = f"Invite failed: {error}"
 
             if network and network.role == "client":
                 for command in outgoing:
@@ -1369,6 +1524,10 @@ def run(win: curses.window) -> None:
                     network.reset_peer()
                     game.state = "hosting"
                     game.network_status = "Player left — waiting for another knight"
+                elif event == "left" and network and network.role == "client":
+                    network.reset_peer()
+                    game.state = "searching"
+                    game.network_status = "Host left — searching again"
 
             if width >= MIN_WIDTH and height >= MIN_HEIGHT:
                 if network is None:
