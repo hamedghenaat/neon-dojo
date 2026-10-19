@@ -9,7 +9,6 @@ except ImportError:
     curses = None  # type: ignore[assignment]
 
 import getpass
-import ipaddress
 import json
 import importlib
 import locale
@@ -17,27 +16,32 @@ import math
 import os
 import platform
 import random
-import socket
 import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from networking import (
+    NetworkSession,
+    apply_game_data,
+    local_server_addresses,
+    network_ready,
+    normalize_player_name as normalize_character_name,
+)
+
 
 FPS = 30
 ROUND_TIME = 60.0
+FINISHER_DURATION = 3.8
+WEDDING_DURATION = 6.2
 MIN_WIDTH = 72
 MIN_HEIGHT = 23
 SPRITE_WIDTH = 17
-GAME_PORT = 48765
-DISCOVERY_PORT = GAME_PORT
-PROTOCOL_VERSION = 2
 MENU_ITEMS = ("SINGLE PLAYER", "ADD SERVER", "JOIN SERVER", "SETTINGS")
 SETTINGS_ITEMS = ("USE OS USERNAME", "SET CUSTOM NAME", "BACK")
 SETUP_VERSION = 1
 MIN_PYTHON = (3, 10)
-MAX_NAME_LENGTH = 16
 
 
 @dataclass(frozen=True)
@@ -57,15 +61,6 @@ def setup_cache_path() -> Path:
 def settings_path() -> Path:
     config_root = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
     return config_root / "neon-dojo" / "settings.json"
-
-
-def normalize_character_name(value: object, fallback: str = "PLAYER") -> str:
-    """Return a short, single-line name that is safe to draw and send."""
-    if not isinstance(value, str):
-        return fallback
-    printable = "".join(character if character.isprintable() else " " for character in value)
-    compact = " ".join(printable.split())
-    return compact[:MAX_NAME_LENGTH] or fallback
 
 
 def os_username() -> str:
@@ -115,149 +110,6 @@ def save_settings(settings: PlayerSettings) -> bool:
     return True
 
 
-@dataclass(frozen=True)
-class IPv4Interface:
-    name: str
-    address: str
-    prefix_length: int
-    broadcast: str
-
-
-def ipv4_interfaces() -> list[IPv4Interface]:
-    """Return active, non-container IPv4 interfaces without extra packages."""
-    interfaces: list[IPv4Interface] = []
-    try:
-        result = subprocess.run(
-            ["ip", "-j", "-4", "address", "show", "up"],
-            capture_output=True,
-            text=True,
-            timeout=1.0,
-            check=False,
-        )
-        records = json.loads(result.stdout) if result.returncode == 0 else []
-    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
-        records = []
-
-    ignored_prefixes = ("br-", "docker", "veth", "virbr")
-    if isinstance(records, list):
-        for record in records:
-            if not isinstance(record, dict):
-                continue
-            name = str(record.get("ifname", ""))
-            if name == "lo" or name.startswith(ignored_prefixes):
-                continue
-            for address_data in record.get("addr_info", []):
-                if not isinstance(address_data, dict) or address_data.get("family") != "inet":
-                    continue
-                address = str(address_data.get("local", ""))
-                try:
-                    prefix_length = int(address_data.get("prefixlen", 24))
-                    network = ipaddress.IPv4Network(f"{address}/{prefix_length}", strict=False)
-                except (ipaddress.AddressValueError, ipaddress.NetmaskValueError, ValueError):
-                    continue
-                broadcast = str(address_data.get("broadcast") or network.broadcast_address)
-                interfaces.append(IPv4Interface(name, address, prefix_length, broadcast))
-
-    if interfaces:
-        return interfaces
-
-    # Portable fallback for systems without Linux's `ip` command.
-    try:
-        addresses = {
-            info[4][0]
-            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
-            if info[4][0] != "127.0.0.1"
-        }
-    except OSError:
-        addresses = set()
-    for address in sorted(addresses):
-        try:
-            network = ipaddress.IPv4Network(f"{address}/24", strict=False)
-        except ipaddress.AddressValueError:
-            continue
-        interfaces.append(IPv4Interface("network", address, 24, str(network.broadcast_address)))
-    return interfaces
-
-
-def _tailscale_targets(data: object) -> list[str]:
-    """Expand online peers and bounded subnet routes from Tailscale status."""
-    peers = data.get("Peer", {}) if isinstance(data, dict) else {}
-    if not isinstance(peers, dict):
-        return []
-    addresses: set[str] = set()
-    for peer in peers.values():
-        if not isinstance(peer, dict) or peer.get("Online") is False:
-            continue
-        for address in peer.get("TailscaleIPs", []):
-            try:
-                parsed = ipaddress.ip_address(address)
-            except ValueError:
-                continue
-            if isinstance(parsed, ipaddress.IPv4Address):
-                addresses.add(str(parsed))
-        for route in peer.get("PrimaryRoutes", []):
-            try:
-                network = ipaddress.ip_network(route, strict=False)
-            except ValueError:
-                continue
-            if not isinstance(network, ipaddress.IPv4Network) or network.num_addresses > 256:
-                continue
-            addresses.update(str(address) for address in network.hosts())
-    return sorted(addresses, key=ipaddress.IPv4Address)
-
-
-def tailscale_peer_addresses() -> list[str]:
-    """Read peer and subnet-route targets from the optional Tailscale CLI."""
-    try:
-        result = subprocess.run(
-            ["tailscale", "status", "--json"],
-            capture_output=True,
-            text=True,
-            timeout=1.0,
-            check=False,
-        )
-        data = json.loads(result.stdout) if result.returncode == 0 else {}
-    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
-        return []
-    return _tailscale_targets(data)
-
-
-def discovery_broadcast_addresses(
-    interfaces: list[IPv4Interface] | None = None,
-) -> list[str]:
-    interfaces = ipv4_interfaces() if interfaces is None else interfaces
-    return list(dict.fromkeys(["255.255.255.255", "127.0.0.1", *(item.broadcast for item in interfaces)]))
-
-
-def discovery_probe_addresses(
-    interfaces: list[IPv4Interface] | None = None,
-    tailscale_peers: list[str] | None = None,
-) -> list[str]:
-    """Build LAN broadcasts and bounded unicast probes for routed overlays."""
-    interfaces = ipv4_interfaces() if interfaces is None else interfaces
-    tailscale_peers = tailscale_peer_addresses() if tailscale_peers is None else tailscale_peers
-    targets = discovery_broadcast_addresses(interfaces)
-    targets.extend(tailscale_peers)
-    for interface in interfaces:
-        try:
-            # Scan at most one /24 per interface to keep discovery bounded on
-            # large corporate, VPN, and container networks.
-            prefix_length = max(24, interface.prefix_length)
-            network = ipaddress.IPv4Network(
-                f"{interface.address}/{prefix_length}",
-                strict=False,
-            )
-        except (ipaddress.AddressValueError, ipaddress.NetmaskValueError):
-            continue
-        targets.extend(str(address) for address in network.hosts())
-
-    # Tailscale is layer 3 and does not carry broadcasts. This project's
-    # tailnet uses 100.64.0.0/24, so probe that bounded range with unicast.
-    targets.extend(str(address) for address in ipaddress.IPv4Network("100.64.0.0/24").hosts())
-    local_addresses = {item.address for item in interfaces}
-    return [address for address in dict.fromkeys(targets) if address not in local_addresses]
-
-
 def dependency_signature() -> dict[str, object]:
     return {
         "setup_version": SETUP_VERSION,
@@ -276,24 +128,10 @@ def _unicode_ready() -> tuple[bool, str]:
     return True, f"Unicode terminal encoding ({encoding})"
 
 
-def _udp_ready() -> tuple[bool, str]:
-    udp_probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    tcp_probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        udp_probe.bind(("127.0.0.1", 0))
-        tcp_probe.bind(("127.0.0.1", 0))
-        return True, "TCP/UDP networking available"
-    except OSError as error:
-        return False, f"Network socket unavailable: {error}"
-    finally:
-        udp_probe.close()
-        tcp_probe.close()
-
-
 def dependency_checks() -> list[DependencyResult]:
     python_ready = sys.version_info >= MIN_PYTHON
     unicode_ready, unicode_detail = _unicode_ready()
-    udp_ready, udp_detail = _udp_ready()
+    udp_ready, udp_detail = network_ready()
     system = platform.system()
     if system == "Windows":
         curses_command = f'"{sys.executable}" -m pip install windows-curses'
@@ -559,6 +397,8 @@ class Game:
     settings: PlayerSettings = field(default_factory=PlayerSettings)
     settings_index: int = 0
     settings_message: str = ""
+    round_winner: int = 0
+    story_phase: int = 0
 
     def start_match(self, width: int) -> None:
         self.player.wins = 0
@@ -577,6 +417,8 @@ class Game:
         self.particles.clear()
         self.shake = 0.0
         self.freeze = 0.0
+        self.round_winner = 0
+        self.story_phase = 0
 
     def update(self, dt: float, width: int) -> None:
         self.state_time += dt
@@ -594,6 +436,12 @@ class Game:
                 self.state = "fight"
                 self.state_time = 0.0
                 self.banner = ""
+            return
+        if self.state == "finisher":
+            self.update_finisher(dt, width)
+            return
+        if self.state == "wedding":
+            self.update_wedding(dt, width)
             return
         if self.state != "fight":
             return
@@ -710,445 +558,120 @@ class Game:
 
     def end_round(self) -> None:
         if self.player.health == self.enemy.health:
-            self.banner = "DRAW"
+            self.round_winner = 0
+            self.banner = "DRAW - HONOR HOLDS"
+            self.player.action = "victory"
+            self.enemy.action = "victory"
+            self.state = "round_over"
         elif self.player.health > self.enemy.health:
             self.player.wins += 1
-            self.banner = f"{self.player.name} WINS"
+            self.round_winner = 1
+            self.begin_finisher(self.player, self.enemy)
         else:
             self.enemy.wins += 1
-            self.banner = f"{self.enemy.name} WINS"
-        self.state = "round_over"
+            self.round_winner = -1
+            self.begin_finisher(self.enemy, self.player)
         self.state_time = 0.0
+
+    def begin_finisher(self, winner: Fighter, loser: Fighter) -> None:
+        self.state = "finisher"
+        self.story_phase = 0
+        self.banner = f"{winner.name} WINS"
+        self.message = "THE ROYAL FINISH"
+        winner.action = "walk"
+        winner.action_time = 0.0
+        loser.action = "defeated"
+        loser.action_time = 0.0
+
+    def story_fighters(self) -> tuple[Fighter, Fighter]:
+        if self.round_winner == 1:
+            return self.player, self.enemy
+        return self.enemy, self.player
+
+    def update_finisher(self, dt: float, width: int) -> None:
+        winner, loser = self.story_fighters()
+        winner.facing = 1 if loser.x > winner.x else -1
+        loser.facing = -winner.facing
+        target = loser.x - winner.facing * 7.0
+
+        if self.state_time < 1.05:
+            winner.action = "walk"
+            step = min(abs(target - winner.x), 15.0 * dt)
+            winner.x += step if target > winner.x else -step
+            loser.action = "defeated"
+        elif self.state_time < 1.85:
+            winner.action = "finish"
+            loser.action = "defeated"
+            if self.story_phase == 0:
+                self.story_phase = 1
+                self.banner = "BRUTALITY!"
+                loser.health = 0
+                loser.flash_time = 0.18
+                self.shake = 0.28
+                self.spawn_hit(loser.x, 7, 4, big=True)
+        else:
+            winner.action = "victory"
+            loser.action = "fallen"
+            if self.story_phase < 2:
+                self.story_phase = 2
+                self.banner = f"{winner.name} CLAIMS THE ROUND"
+
+        self.keep_in_arena(width)
+        if self.state_time < FINISHER_DURATION:
+            return
+        if winner.wins >= 2:
+            self.start_wedding(winner, loser)
+        else:
+            self.state = "round_over"
+            self.state_time = 0.0
+
+    def start_wedding(self, winner: Fighter, loser: Fighter) -> None:
+        self.state = "wedding"
+        self.state_time = 0.0
+        self.story_phase = 0
+        self.banner = "THE CASTLE AWAITS"
+        self.message = "TANGLED: ASCEND, BRAVE KNIGHT!"
+        winner.action = "walk"
+        winner.jump_y = 0.0
+        loser.action = "fallen"
+
+    def update_wedding(self, dt: float, width: int) -> None:
+        champion, loser = self.story_fighters()
+        castle_x = width / 2
+        loser.action = "fallen"
+
+        if self.state_time < 1.6:
+            champion.action = "walk"
+            step = min(abs(castle_x - champion.x), 17.0 * dt)
+            champion.x += step if castle_x > champion.x else -step
+            champion.facing = 1 if castle_x >= champion.x else -1
+        elif self.state_time < 4.4:
+            self.story_phase = max(self.story_phase, 1)
+            champion.action = "climb"
+            champion.x += (castle_x - champion.x) * min(1.0, dt * 7.0)
+            champion.jump_y = min(10.0, (self.state_time - 1.6) * 3.8)
+            champion.facing = 1
+            self.banner = "ASCEND TO TANGLED"
+        else:
+            champion.action = "victory"
+            champion.x = castle_x
+            champion.jump_y = 10.0
+            if self.story_phase < 2:
+                self.story_phase = 2
+                self.spawn_hit(castle_x, 20, 3, big=True)
+            self.banner = f"TANGLED ♥ {champion.name}"
+            self.message = "A NEW LEGEND BEGINS"
+
+        if self.state_time >= WEDDING_DURATION:
+            self.state = "match_over"
+            self.state_time = 0.0
+            self.banner = f"TANGLED ♥ {champion.name}"
 
     def advance(self, width: int) -> None:
         if self.state != "round_over":
             return
-        if self.player.wins >= 2 or self.enemy.wins >= 2:
-            self.state = "match_over"
-            self.state_time = 0.0
-            champion = self.player.name if self.player.wins > self.enemy.wins else self.enemy.name
-            self.banner = f"CHAMPION: {champion}"
-        else:
-            self.round_number += 1
-            self.start_round(width)
-
-
-def _fighter_data(fighter: Fighter) -> dict[str, object]:
-    return {
-        "name": fighter.name,
-        "x": fighter.x,
-        "color": fighter.color,
-        "facing": fighter.facing,
-        "health": fighter.health,
-        "meter": fighter.meter,
-        "wins": fighter.wins,
-        "jump_y": fighter.jump_y,
-        "velocity_y": fighter.velocity_y,
-        "action": fighter.action,
-        "action_time": fighter.action_time,
-        "action_hit": fighter.action_hit,
-        "hitstun": fighter.hitstun,
-        "block_time": fighter.block_time,
-        "flash_time": fighter.flash_time,
-        "combo": fighter.combo,
-        "combo_time": fighter.combo_time,
-    }
-
-
-def game_to_data(game: Game) -> dict[str, object]:
-    """Create the small authoritative snapshot sent by a host."""
-    return {
-        "state": game.state,
-        "round_number": game.round_number,
-        "round_time": game.round_time,
-        "state_time": game.state_time,
-        "banner": game.banner,
-        "message": game.message,
-        "shake": game.shake,
-        "freeze": game.freeze,
-        "player": _fighter_data(game.player),
-        "enemy": _fighter_data(game.enemy),
-        "particles": [p.__dict__ for p in game.particles[-32:]],
-    }
-
-
-def apply_game_data(game: Game, data: object) -> bool:
-    """Apply a validated-enough network snapshot without trusting extra keys."""
-    if not isinstance(data, dict):
-        return False
-    try:
-        state = str(data["state"])
-        if state not in {"intro", "fight", "round_over", "match_over", "paused"}:
-            return False
-        player_data = data["player"]
-        enemy_data = data["enemy"]
-        if not isinstance(player_data, dict) or not isinstance(enemy_data, dict):
-            return False
-        player = Fighter(**{key: player_data[key] for key in Fighter.__dataclass_fields__})
-        enemy = Fighter(**{key: enemy_data[key] for key in Fighter.__dataclass_fields__})
-        particles_raw = data.get("particles", [])
-        particles = [Particle(**item) for item in particles_raw if isinstance(item, dict)]
-        game.state = state
-        game.round_number = int(data["round_number"])
-        game.round_time = float(data["round_time"])
-        game.state_time = float(data["state_time"])
-        game.banner = str(data["banner"])
-        game.message = str(data["message"])
-        game.shake = float(data["shake"])
-        game.freeze = float(data["freeze"])
-        game.player = player
-        game.enemy = enemy
-        game.particles = particles[:32]
-    except (KeyError, TypeError, ValueError):
-        return False
-    return True
-
-
-def local_ip_address() -> str:
-    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        probe.connect(("192.0.2.1", 9))
-        return str(probe.getsockname()[0])
-    except OSError:
-        try:
-            return socket.gethostbyname(socket.gethostname())
-        except OSError:
-            return "127.0.0.1"
-    finally:
-        probe.close()
-
-
-def local_server_addresses() -> str:
-    addresses = list(dict.fromkeys(item.address for item in ipv4_interfaces()))
-    if not addresses:
-        addresses = [local_ip_address()]
-    return " / ".join(f"{address}:{GAME_PORT}" for address in addresses)
-
-
-def parse_server_address(value: str) -> tuple[str, int]:
-    value = value.strip()
-    if not value:
-        raise ValueError("server address is empty")
-    host = value
-    port = GAME_PORT
-    if value.count(":") == 1:
-        host, raw_port = value.rsplit(":", 1)
-        if raw_port:
-            port = int(raw_port)
-    if not (1 <= port <= 65535):
-        raise ValueError("port must be between 1 and 65535")
-    return socket.gethostbyname(host), port
-
-
-class NetworkSession:
-    """UDP discovery with a reliable TCP gameplay connection.
-
-    Both roles listen on the gameplay port. Usually the joining player connects
-    to the host. On asymmetric networks the host can instead connect outward to
-    the waiting player with ``invite_player``.
-    """
-
-    def __init__(self, role: str, player_name: str = "PLAYER") -> None:
-        self.role = role
-        self.player_name = normalize_character_name(player_name)
-        self.peer: tuple[str, int] | None = None
-        self.last_send = 0.0
-        self.last_seen = time.monotonic()
-        self.session_id = f"{random.getrandbits(48):012x}"
-        self.connected = False
-        self.connection: socket.socket | None = None
-        self.connection_lost = False
-        self.receive_buffer = bytearray()
-        self.send_buffer = bytearray()
-        self.discovery_targets: list[str] = []
-        self.discovery_broadcasts = discovery_broadcast_addresses()
-        self.discovery_cursor = 0
-        self.last_discovery_cycle = time.monotonic()
-
-        self.discovery = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.discovery.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.discovery.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        self.discovery.bind(("0.0.0.0", DISCOVERY_PORT))
-        self.discovery.setblocking(False)
-        if role == "client":
-            self.discovery_targets = discovery_probe_addresses()
-
-        self.listener: socket.socket | None = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            self.listener.bind(("0.0.0.0", GAME_PORT))
-            self.listener.listen(2)
-            self.listener.setblocking(False)
-        except OSError:
-            self.listener.close()
-            self.listener = None
-            if role == "host":
-                self.discovery.close()
-                raise
-
-    def _send_discovery(self, payload: dict[str, object], address: tuple[str, int]) -> None:
-        try:
-            encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-            self.discovery.sendto(encoded, address)
-        except (OSError, TypeError, ValueError):
-            pass
-
-    def _announcement(self) -> dict[str, object]:
-        return {
-            "v": PROTOCOL_VERSION,
-            "t": "announce",
-            "port": GAME_PORT,
-            "id": self.session_id,
-        }
-
-    def _send_discovery_probes(self, now: float) -> None:
-        if self.role != "client" or self.connection is not None:
-            return
-        if self.discovery_cursor >= len(self.discovery_targets):
-            if now - self.last_discovery_cycle < 2.0:
-                return
-            self.discovery_cursor = 0
-            self.last_discovery_cycle = now
-        probe = {"v": PROTOCOL_VERSION, "t": "discover"}
-        stop = min(len(self.discovery_targets), self.discovery_cursor + 32)
-        for address in self.discovery_targets[self.discovery_cursor:stop]:
-            self._send_discovery(probe, (address, DISCOVERY_PORT))
-        self.discovery_cursor = stop
-
-    def _queue(self, payload: dict[str, object]) -> None:
-        if self.connection is None:
-            return
-        try:
-            packet = json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n"
-        except (TypeError, ValueError):
-            return
-        if len(self.send_buffer) > 262_144 and payload.get("t") == "state":
-            self.send_buffer.clear()
-        self.send_buffer.extend(packet)
-        self._flush()
-
-    def _flush(self) -> None:
-        if self.connection is None or not self.send_buffer:
-            return
-        try:
-            sent = self.connection.send(self.send_buffer)
-            del self.send_buffer[:sent]
-        except BlockingIOError:
-            pass
-        except OSError:
-            self.connection_lost = True
-            self._drop_connection()
-
-    def _set_connection(self, connection: socket.socket, address: tuple[str, int]) -> None:
-        connection.setblocking(False)
-        connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        self.connection = connection
-        self.peer = address
-        self.receive_buffer.clear()
-        self.send_buffer.clear()
-        self.connected = False
-        self.last_seen = time.monotonic()
-        self.last_send = 0.0
-
-    def _connect(self, address: tuple[str, int]) -> None:
-        if self.connection is not None:
-            self._drop_connection()
-        self.connection_lost = False
-        connection = socket.create_connection(address, timeout=1.5)
-        self._set_connection(connection, address)
-
-    def connect_direct(self, value: str) -> str:
-        if self.role != "client":
-            raise ValueError("only a joining player can connect to a server")
-        address = parse_server_address(value)
-        self._connect(address)
-        self._queue({"v": PROTOCOL_VERSION, "t": "join", "name": self.player_name})
-        return f"Connecting to {address[0]}:{address[1]}"
-
-    def invite_player(self, value: str) -> str:
-        if self.role != "host":
-            raise ValueError("only a host can invite a waiting player")
-        address = parse_server_address(value)
-        self._connect(address)
-        return f"Inviting player at {address[0]}:{address[1]}"
-
-    def send_command(self, command: str) -> None:
-        if self.role == "client" and self.connection:
-            self._queue({"v": PROTOCOL_VERSION, "t": "input", "key": command})
-
-    def _accept_connections(self, events: list[str]) -> None:
-        if self.listener is None:
-            return
-        while True:
-            try:
-                connection, address = self.listener.accept()
-            except BlockingIOError:
-                break
-            except OSError:
-                break
-            if self.connection is not None:
-                try:
-                    connection.sendall(json.dumps({"v": PROTOCOL_VERSION, "t": "busy"}).encode() + b"\n")
-                except OSError:
-                    pass
-                connection.close()
-                continue
-            self._set_connection(connection, address)
-            if self.role == "client":
-                self._queue({"v": PROTOCOL_VERSION, "t": "join", "name": self.player_name})
-                events.append("found")
-
-    def _poll_discovery(self, events: list[str]) -> None:
-        while True:
-            try:
-                packet, address = self.discovery.recvfrom(8192)
-            except BlockingIOError:
-                break
-            except OSError:
-                break
-            try:
-                data = json.loads(packet.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                continue
-            if not isinstance(data, dict) or data.get("v") != PROTOCOL_VERSION:
-                continue
-            kind = data.get("t")
-            if kind == "discover" and self.role == "host" and self.connection is None:
-                self._send_discovery(self._announcement(), address)
-                continue
-            if kind != "announce" or self.role != "client" or self.connection is not None:
-                continue
-            try:
-                port = int(data.get("port", GAME_PORT))
-            except (TypeError, ValueError):
-                continue
-            if not (1 <= port <= 65535):
-                continue
-            try:
-                self._connect((address[0], port))
-            except OSError:
-                continue
-            self._queue({"v": PROTOCOL_VERSION, "t": "join", "name": self.player_name})
-            events.append("found")
-            break
-
-    def _poll_stream(self, game: Game, events: list[str]) -> None:
-        if self.connection is None:
-            return
-        while True:
-            try:
-                packet = self.connection.recv(65536)
-            except BlockingIOError:
-                break
-            except OSError:
-                packet = b""
-            if not packet:
-                events.append("left")
-                self._drop_connection()
-                return
-            self.receive_buffer.extend(packet)
-            if len(self.receive_buffer) > 1_048_576:
-                events.append("left")
-                self._drop_connection()
-                return
-        while b"\n" in self.receive_buffer:
-            raw, _, remainder = self.receive_buffer.partition(b"\n")
-            self.receive_buffer = bytearray(remainder)
-            try:
-                data = json.loads(raw.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                continue
-            if not isinstance(data, dict) or data.get("v") != PROTOCOL_VERSION:
-                continue
-            self.last_seen = time.monotonic()
-            kind = data.get("t")
-            if self.role == "host":
-                if kind == "join" and not self.connected:
-                    game.enemy.name = normalize_character_name(data.get("name", "PLAYER"))
-                    self.connected = True
-                    events.append("joined")
-                elif kind == "input" and isinstance(data.get("key"), str):
-                    events.append(f"input:{data['key']}")
-                elif kind == "leave":
-                    events.append("left")
-                    self._drop_connection()
-                    return
-            else:
-                if kind == "state" and apply_game_data(game, data.get("game")):
-                    was_connected = self.connected
-                    self.connected = True
-                    if not was_connected:
-                        events.append("connected")
-                elif kind == "busy":
-                    events.append("busy")
-                    self._drop_connection()
-                    return
-                elif kind == "leave":
-                    events.append("left")
-                    self._drop_connection()
-                    return
-
-    def poll(self, game: Game) -> list[str]:
-        events: list[str] = []
-        if self.connection_lost:
-            events.append("left")
-            self.connection_lost = False
-        self._accept_connections(events)
-        self._poll_discovery(events)
-        self._poll_stream(game, events)
-        self._flush()
-        return events
-
-    def tick(self, game: Game) -> list[str]:
-        now = time.monotonic()
-        events: list[str] = []
-        if self.role == "host":
-            if self.connection is None and now - self.last_send >= 0.75:
-                announcement = self._announcement()
-                for address in self.discovery_broadcasts:
-                    self._send_discovery(announcement, (address, DISCOVERY_PORT))
-                self.last_send = now
-            elif self.connected and now - self.last_send >= 1 / 20:
-                self._queue({"v": PROTOCOL_VERSION, "t": "state", "game": game_to_data(game)})
-                self.last_send = now
-        else:
-            self._send_discovery_probes(now)
-            if self.connection and now - self.last_send >= 0.5:
-                self._queue({"v": PROTOCOL_VERSION, "t": "ping"})
-                self.last_send = now
-        self._flush()
-        if self.connection and now - self.last_seen > 7.0:
-            events.append("timeout")
-        return events
-
-    def _drop_connection(self) -> None:
-        if self.connection:
-            try:
-                self.connection.close()
-            except OSError:
-                pass
-        self.connection = None
-        self.peer = None
-        self.connected = False
-        self.receive_buffer.clear()
-        self.send_buffer.clear()
-
-    def close(self) -> None:
-        if self.connection:
-            self._queue({"v": PROTOCOL_VERSION, "t": "leave"})
-            self._flush()
-        self._drop_connection()
-        for sock in (self.listener, self.discovery):
-            if sock:
-                try:
-                    sock.close()
-                except OSError:
-                    pass
-
-    def reset_peer(self) -> None:
-        self._drop_connection()
-        self.last_seen = time.monotonic()
-        self.last_send = 0.0
+        self.round_number += 1
+        self.start_round(width)
 
 
 def safe_add(win: curses.window, y: int, x: int, text: str, attr: int = 0) -> None:
@@ -1288,12 +811,89 @@ def fighter_sprite(f: Fighter, tick: int) -> list[str]:
             "    mBmB",
             "     BB",
         ),
+        "defeated": _frame(
+            "      RRR",
+            "     RRRR",
+            "      MMMMM",
+            "     MMOFOMM",
+            "   HHMMMMMM",
+            "   HEH mMMm",
+            "   HHH mMm",
+            "      m m",
+            "     BB BB",
+        ),
+        "finish": _frame(
+            "    RRR       S",
+            "   RRRR      S",
+            "    MMMMM   S",
+            "   MMFOFMM S",
+            " HHMMMMMMMG",
+            " HEH mMMM",
+            " HHH mMm",
+            "     m m",
+            "    BB BB",
+        ),
+        "victory": _frame(
+            "    RRR    SS",
+            "   RRRR  SS",
+            "    MMMMMS",
+            "   MMFOFMG",
+            " HHMMMMMMM",
+            " HEH mMMm",
+            " HHH mMm",
+            "     m m",
+            "    BB BB",
+        ),
+        "fallen": _frame(
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            " RRR       SS",
+            "HHMMMMMMMMG",
+            "HEH BB BB",
+        ),
+        "climb": _frame(
+            "     RRR",
+            "    RRRR",
+            "     MMMMM",
+            "    MMFOFMM",
+            "   HHMMMMMM",
+            "   HEH mMMm",
+            "   HHH mMm",
+            "      m m",
+            "     BB BB",
+        ),
         "walk": idle_b if tick % 2 else idle_a,
         "idle": idle_b if (tick // 12) % 2 else idle_a,
     }
     key = "block" if f.blocking else f.action
     lines = poses.get(key, idle_a)
     return lines if f.facing == 1 else [line[::-1] for line in lines]
+
+
+def tangled_sprite(tick: int) -> list[str]:
+    """Return Tangled as a compact pixel-art princess inspired by her portrait.
+
+    Y/y = golden hair, F = face, E = green eyes, N/S = nose/smile,
+    P/p = purple dress, and H = the pink bodice detail.
+    """
+    eyes = " yYYFFFFFFFFFYYy " if tick % 90 in (0, 1, 2, 3) else " yYYFFEFFFEFFYYy "
+    return [
+        "     yYYYYYy     ",
+        "   yYYYYYYYYYy   ",
+        "  yYYFFFFFFFYYy  ",
+        eyes,
+        " yYYFFFFNFFFFYYy ",
+        "  YYFFFFSFFFFYY  ",
+        "   YYYFFFFFYYY   ",
+        "   YYpPPHPPpYY   ",
+        "   YYFPPHPPFYY   ",
+        "    YYPPPPPYY    ",
+        "    PPPPPPPPP    ",
+    ]
 
 
 class Renderer:
@@ -1340,7 +940,7 @@ class Renderer:
             return
         shake_x = random.choice((-1, 0, 1)) if game.shake > 0 else 0
         shake_y = random.choice((-1, 0)) if game.shake > 0 else 0
-        self.draw_arena(width, height, tick, shake_x, shake_y)
+        self.draw_arena(game, width, height, tick, shake_x, shake_y)
         if game.state == "title":
             self.draw_title(game, width, height, tick)
             self.win.refresh()
@@ -1353,10 +953,17 @@ class Renderer:
             self.draw_network_lobby(game, width, height, tick)
             self.win.refresh()
             return
-        self.draw_hud(game, width)
         ground = height - 5 + shake_y
-        self.draw_fighter(game.player, ground, tick, shake_x)
-        self.draw_fighter(game.enemy, ground, tick, shake_x)
+        if game.state not in ("wedding", "match_over"):
+            self.draw_hud(game, width)
+            self.draw_fighter(game.player, ground, tick, shake_x)
+            self.draw_fighter(game.enemy, ground, tick, shake_x)
+        elif game.state == "wedding":
+            champion, loser = game.story_fighters()
+            if game.state_time < 2.2:
+                self.draw_fighter(loser, ground, tick, shake_x)
+            if game.state_time < 4.4:
+                self.draw_fighter(champion, ground, tick, shake_x)
         self.draw_particles(game, ground, shake_x)
         self.draw_overlays(game, width, height, tick)
         self.win.refresh()
@@ -1366,50 +973,130 @@ class Renderer:
         for i, line in enumerate(lines):
             safe_add(self.win, max(0, height // 2 - 2 + i), max(0, (width - len(line)) // 2), line, self.c(2 if i == 0 else 1, True))
 
-    def draw_arena(self, width: int, height: int, tick: int, ox: int, oy: int) -> None:
-        # Neon moon and star field.
-        moon_x = width - 18 + ox
-        for row, text in enumerate(("  .------.  ", " /        \\ ", "|  //////  |", " \\        / ", "  '------'  ")):
-            safe_add(self.win, 5 + row + oy, moon_x, text, self.c(3, bold=row in (0, 4)))
-        for i in range(max(8, width // 8)):
-            x = (i * 19 + 7) % max(1, width - 2)
-            y = 5 + (i * 7) % max(1, height - 16)
-            char = "." if (tick + i) % 9 else "+"
-            safe_add(self.win, y + oy, x + ox, char, self.c(2 if i % 3 else 1, dim=True))
-
-        # Parallax skyline.
+    def draw_arena(self, game: Game, width: int, height: int, tick: int, ox: int, oy: int) -> None:
         base = height - 7 + oy
-        x = -((tick // 10) % 7) + ox
-        building = 0
-        while x < width:
-            bw = 5 + (building * 3) % 8
-            bh = 3 + (building * 5) % max(4, height - 14)
-            for row in range(bh):
-                y = base - bh + row
-                body = "▓" * bw
-                safe_add(self.win, y, x, body, self.c(6, dim=True))
-                if row % 2 == 1:
-                    for wx in range(1, bw - 1, 3):
-                        if (row + wx + building) % 4:
-                            safe_add(self.win, y, x + wx, "·", self.c(3))
-            x += bw + 2
-            building += 1
 
-        # Floor line and perspective grid.
-        safe_add(self.win, base, 0, "━" * (width - 1), self.c(2, True))
-        floor_rows = max(3, height - base - 1)
-        for row in range(1, floor_rows):
-            y = base + row
-            pattern = [" " for _ in range(width - 1)]
-            stride = max(6, 18 - row * 3)
-            phase = (row * 2 + tick // 4) % stride
-            for col in range(phase, width - 1, stride):
-                pattern[col] = "╱" if col < width // 2 else "╲"
-            char = "─" if (row + tick // 6) % 3 == 0 else "·"
-            for col in range(0, width - 1, 2):
-                if pattern[col] == " ":
-                    pattern[col] = char
-            safe_add(self.win, y, 0, "".join(pattern), self.c(2, dim=True))
+        # Dense jungle frames the castle while leaving the fighters readable.
+        tree_centers = (4, 14, width - 15, width - 5)
+        for index, center in enumerate(tree_centers):
+            sway = -1 if (tick // 18 + index) % 2 else 0
+            canopy_y = 5 + (index % 2) + oy
+            for row, leaves in enumerate(("♣♣♣", "♣♣♣♣♣", "♣♣♣♣♣♣♣", "♣♣♣♣♣")):
+                safe_add(
+                    self.win,
+                    canopy_y + row,
+                    center - len(leaves) // 2 + sway + ox,
+                    leaves,
+                    self.c(7, bold=row < 2, dim=row > 1),
+                )
+            for y in range(canopy_y + 4, base):
+                trunk = "╲║╱" if y == canopy_y + 4 else " ║ "
+                safe_add(self.win, y, center - 1 + ox, trunk, self.c(4, dim=True))
+            vine_x = center + (-4 if center < width // 2 else 4) + ox
+            for y in range(canopy_y + 1, min(base, canopy_y + 7)):
+                safe_add(self.win, y, vine_x, "│" if (y + tick // 10) % 2 else "╵", self.c(7, dim=True))
+
+        castle = (
+            "             /\\             ",
+            "        ____/  \\____        ",
+            "       /   TANGLED   \\       ",
+            "  ____|╔════════════╗|____  ",
+            " | [] |║            ║| [] | ",
+            " |    |║            ║|    | ",
+            " | [] |║            ║| [] | ",
+            " |    |║            ║|    | ",
+            " | [] |╚════════════╝| [] | ",
+            " |    |      ██      |    | ",
+            " | [] |      ██      | [] | ",
+            " |____|______██______|____| ",
+        )
+        castle_width = max(map(len, castle))
+        castle_x = (width - castle_width) // 2 + ox
+        castle_y = 5 + oy
+        for row, line in enumerate(castle):
+            text = line.center(castle_width)
+            attr = self.c(4, True) if row in (2, 3, 8) else self.c(6, bold=row in (0, 1), dim=row > 3)
+            safe_add(self.win, castle_y + row, castle_x, text, attr)
+
+        center = width // 2 + ox
+        married = game.state == "match_over" or (game.state == "wedding" and game.state_time >= 4.4)
+        tangled_center = center + (3 if married else 0)
+        self.draw_tangled(tangled_center, castle_y + 1, base, tick)
+        if married:
+            self.draw_window_knight(game, center - 7, castle_y + 4)
+            self.draw_wedding_heart(center + castle_width // 2 + 8, castle_y + 3, tick)
+
+        # Grass and roots replace the old neon grid floor.
+        grass = "".join("♣" if (col + tick // 8) % 7 == 0 else "━" for col in range(width - 1))
+        safe_add(self.win, base, 0, grass, self.c(7, True))
+        for row in range(1, max(3, height - base - 1)):
+            pattern = "".join("╱" if (col + row * 3) % 17 == 0 else ("·" if col % 2 == 0 else " ") for col in range(width - 1))
+            safe_add(self.win, base + row, 0, pattern, self.c(4 if row > 2 else 7, dim=True))
+
+    def draw_tangled(self, center: int, top: int, base: int, tick: int) -> None:
+        sprite = tangled_sprite(tick)
+        left = center - len(sprite[0]) // 2
+        glyphs = {
+            "Y": "▓",  # long golden hair
+            "y": "▒",  # golden highlights
+            "F": "░",  # face and hands
+            "E": "●",  # green eyes
+            "N": "·",  # small nose
+            "S": "⌣",  # smile
+            "P": "█",  # royal purple dress
+            "p": "▓",  # striped sleeves
+            "H": "♥",  # pink bodice embroidery
+        }
+        colors = {
+            "Y": self.c(4, True),
+            "y": self.c(4),
+            "F": self.c(1, True),
+            "E": self.c(7, True),
+            "N": self.c(4, True),
+            "S": self.c(5, True),
+            "P": self.c(3, True),
+            "p": self.c(3),
+            "H": self.c(5, True),
+        }
+        for row, line in enumerate(sprite):
+            for col, code in enumerate(line):
+                if code != " ":
+                    safe_add(self.win, top + row, left + col, glyphs[code], colors[code])
+
+        # One long braid hangs from the window and sways in the breeze.
+        braid_x = left + len(sprite[0]) - 2
+        for y in range(top + 5, base):
+            sway = (y + tick // 12) % 2
+            safe_add(self.win, y, braid_x + sway, "●", self.c(4, True))
+        safe_add(self.win, base - 1, braid_x + 1, "◉", self.c(4, True))
+
+    def draw_wedding_heart(self, center: int, top: int, tick: int) -> None:
+        heart = (
+            " ♥♥♥   ♥♥♥ ",
+            "♥♥♥♥♥ ♥♥♥♥♥",
+            "♥♥♥♥♥♥♥♥♥♥♥",
+            " ♥♥♥♥♥♥♥♥♥ ",
+            "  ♥♥♥♥♥♥♥  ",
+            "   ♥♥♥♥♥   ",
+            "    ♥♥♥    ",
+            "     ♥     ",
+        )
+        width = max(map(len, heart))
+        attr = self.c(5 if tick % 12 < 6 else 3, True)
+        for row, line in enumerate(heart):
+            for col, char in enumerate(line.center(width)):
+                if char == "♥":
+                    safe_add(self.win, top + row, center - width // 2 + col, char, attr)
+
+    def draw_window_knight(self, game: Game, center: int, top: int) -> None:
+        champion, _ = game.story_fighters()
+        sprite = (" RRR ", " MMM ", "MFOFM", "HMMMG", "H m S", " m m ", "B   B")
+        glyphs = {"R": "▓", "M": "█", "F": "▒", "O": "●", "H": "▐", "G": "◆", "S": "╱", "m": "▓", "B": "▄"}
+        colors = {"R": 5, "M": champion.color, "F": 4, "O": 1, "H": champion.color, "G": 4, "S": 1, "m": champion.color, "B": champion.color}
+        for row, line in enumerate(sprite):
+            for col, code in enumerate(line):
+                if code != " ":
+                    safe_add(self.win, top + row, center - 2 + col, glyphs[code], self.c(colors[code], True))
 
     def draw_hud(self, game: Game, width: int) -> None:
         bar_width = max(14, min(32, (width - 24) // 2))
@@ -1472,16 +1159,33 @@ class Renderer:
             safe_add(self.win, ground - round(p.y / 2), round(p.x) + ox, p.char, self.c(p.color, True))
 
     def draw_overlays(self, game: Game, width: int, height: int, tick: int) -> None:
+        if game.state in ("intro", "fight") and tick % 180 < 118:
+            cheers = (
+                "TANGLED: FIGHT, BRAVE KNIGHTS!",
+                "TANGLED: SHOW YOUR COURAGE!",
+                "TANGLED: ONE SHALL ASCEND!",
+            )
+            cheer = cheers[(tick // 180) % len(cheers)]
+            safe_add(self.win, 4, (width - len(cheer)) // 2, cheer, self.c(4, True))
         if game.banner:
             attr = self.c(4 if game.banner == "FIGHT!" else 3, True) | (curses.A_REVERSE if game.banner == "FIGHT!" and tick % 6 < 3 else 0)
             text = f"  {game.banner}  "
-            safe_add(self.win, height // 2 - 3, (width - len(text)) // 2, text, attr)
+            banner_y = 3 if game.state in ("wedding", "match_over") else height // 2 - 3
+            safe_add(self.win, banner_y, (width - len(text)) // 2, text, attr)
+        if game.state == "finisher":
+            story = "TANGLED: THE VICTOR CLAIMS THE FIELD!" if game.story_phase >= 2 else game.message
+            safe_add(self.win, 4, (width - len(story)) // 2, story, self.c(4, True))
         if game.state == "round_over":
             text = "WAITING FOR HOST" if game.mode == "client" else "ENTER  CONTINUE"
             safe_add(self.win, height // 2 - 1, (width - len(text)) // 2, text, self.c(1, True))
+        elif game.state == "wedding":
+            story = game.message if game.story_phase >= 2 else "THE CHAMPION CLIMBS TANGLED'S GOLDEN HAIR"
+            safe_add(self.win, height - 2, (width - len(story)) // 2, story, self.c(4, True))
         elif game.state == "match_over":
             text = "WAITING FOR HOST" if game.mode == "client" else "ENTER  REMATCH    Q  QUIT"
-            safe_add(self.win, height // 2 - 1, (width - len(text)) // 2, text, self.c(1, True))
+            legend = "THE CHAMPION AND TANGLED ARE MARRIED"
+            safe_add(self.win, height - 3, (width - len(legend)) // 2, legend, self.c(4, True))
+            safe_add(self.win, height - 2, (width - len(text)) // 2, text, self.c(1, True))
         elif game.state == "paused":
             text = "  HOST PAUSED  " if game.mode == "client" else "  PAUSED  "
             safe_add(self.win, height // 2 - 2, (width - len(text)) // 2, text, self.c(3, True) | curses.A_REVERSE)
@@ -1494,7 +1198,8 @@ class Renderer:
                 text = f"{f.combo} HIT COMBO"
                 x = 3 if side == 1 else width - len(text) - 3
                 safe_add(self.win, 5, x, text, self.c(f.color, True))
-        safe_add(self.win, height - 1, 1, "← → move  ↑ jump  ↓ crouch  Z punch  X kick  C arc  SPACE block  P pause  Q quit", self.c(1, dim=True))
+        if game.state not in ("wedding", "match_over"):
+            safe_add(self.win, height - 1, 1, "← → move  ↑ jump  ↓ crouch  Z punch  X kick  C arc  SPACE block  P pause  Q quit", self.c(1, dim=True))
 
     def draw_title(self, game: Game, width: int, height: int, tick: int) -> None:
         logo = [
@@ -1809,7 +1514,16 @@ def run(win: curses.window) -> None:
                     network_role = "host" if app_command == "host" else "client"
                     game.player.name = game.settings.character_name
                     game.enemy.name = "PLAYER"
-                    network = NetworkSession(network_role, game.settings.character_name)
+                    network = NetworkSession(
+                        network_role,
+                        game.settings.character_name,
+                        state_applier=lambda target, payload: apply_game_data(
+                            target,
+                            payload,
+                            Fighter,
+                            Particle,
+                        ),
+                    )
                     if app_command == "host":
                         game.mode = "host"
                         game.state = "hosting"

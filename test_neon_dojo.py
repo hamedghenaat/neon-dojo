@@ -6,30 +6,24 @@ from unittest.mock import patch
 
 from neon_dojo import (
     ATTACKS,
-    DISCOVERY_PORT,
-    GAME_PORT,
-    IPv4Interface,
+    FINISHER_DURATION,
     SPRITE_WIDTH,
+    WEDDING_DURATION,
     Fighter,
     Game,
     Particle,
     PlayerSettings,
-    _tailscale_targets,
     _save_setup_cache,
     _setup_cache_matches,
-    apply_game_data,
     bar,
     control_from_key,
     fighter_sprite,
-    game_to_data,
     load_settings,
     mirrored,
     normalize_character_name,
-    parse_server_address,
     save_settings,
+    tangled_sprite,
     dependency_checks,
-    discovery_broadcast_addresses,
-    discovery_probe_addresses,
 )
 
 
@@ -76,15 +70,40 @@ class CombatTests(unittest.TestCase):
         fighter.update(0.13)
         self.assertEqual(fighter.action, "idle")
 
-    def test_best_of_three_reaches_match_result(self):
+    def test_round_winner_performs_finisher_before_continue(self):
+        game = self.make_game()
+        game.enemy.health = 0
+        game.end_round()
+        self.assertEqual(game.player.wins, 1)
+        self.assertEqual(game.round_winner, 1)
+        self.assertEqual(game.state, "finisher")
+        game.update(FINISHER_DURATION, 100)
+        self.assertEqual(game.state, "round_over")
+        self.assertEqual(game.player.action, "victory")
+        self.assertEqual(game.enemy.action, "fallen")
+
+    def test_best_of_three_ends_with_wedding_story(self):
         game = self.make_game()
         game.player.wins = 1
         game.enemy.health = 0
         game.end_round()
         self.assertEqual(game.player.wins, 2)
-        game.advance(100)
+        self.assertEqual(game.state, "finisher")
+        game.update(FINISHER_DURATION, 100)
+        self.assertEqual(game.state, "wedding")
+        game.update(WEDDING_DURATION, 100)
         self.assertEqual(game.state, "match_over")
-        self.assertEqual(game.banner, "CHAMPION: P1")
+        self.assertEqual(game.banner, "TANGLED ♥ P1")
+
+    def test_draw_skips_finisher_and_advances_to_next_round(self):
+        game = self.make_game()
+        game.player.health = game.enemy.health
+        game.end_round()
+        self.assertEqual(game.round_winner, 0)
+        self.assertEqual(game.state, "round_over")
+        game.advance(100)
+        self.assertEqual(game.state, "intro")
+        self.assertEqual(game.round_number, 2)
 
     def test_crouch_uses_shorter_pose_then_stands(self):
         game = self.make_game()
@@ -114,51 +133,15 @@ class CombatTests(unittest.TestCase):
         self.assertIn("E", "".join(facing_right))
         self.assertIn("S", "".join(facing_right))
 
-    def test_network_snapshot_round_trip(self):
-        game = self.make_game()
-        game.player.meter = 72
-        game.particles = [Particle(1, 2, 3, 4, 0.5, "*", 4)]
-        clone = Game(Fighter("A", 0, 1), Fighter("B", 0, 1))
-        self.assertTrue(apply_game_data(clone, game_to_data(game)))
-        self.assertEqual(clone.player.meter, 72)
-        self.assertEqual(clone.particles[0].char, "*")
-
-    def test_direct_server_address(self):
-        self.assertEqual(parse_server_address("127.0.0.1"), ("127.0.0.1", GAME_PORT))
-        self.assertEqual(parse_server_address("127.0.0.1:5000"), ("127.0.0.1", 5000))
-
-    def test_discovery_covers_each_interface_and_tailscale_unicast(self):
-        interfaces = [
-            IPv4Interface("eno1", "172.16.86.200", 24, "172.16.86.255"),
-            IPv4Interface("tailscale0", "100.64.0.8", 32, "100.64.0.8"),
-        ]
-        broadcasts = discovery_broadcast_addresses(interfaces)
-        probes = discovery_probe_addresses(interfaces, ["100.64.0.12"])
-        self.assertEqual(DISCOVERY_PORT, GAME_PORT)
-        self.assertIn("172.16.86.255", broadcasts)
-        self.assertIn("172.16.86.70", probes)
-        self.assertIn("100.64.0.12", probes)
-        self.assertIn("100.64.0.70", probes)
-        self.assertNotIn("100.64.0.8", probes)
-
-    def test_tailscale_subnet_routes_become_discovery_targets(self):
-        status = {
-            "Peer": {
-                "router": {
-                    "Online": True,
-                    "TailscaleIPs": ["100.64.0.12", "fd7a:115c:a1e0::c"],
-                    "PrimaryRoutes": ["2.1.1.0/24", "0.0.0.0/0"],
-                },
-                "offline": {
-                    "Online": False,
-                    "TailscaleIPs": ["100.64.0.99"],
-                },
-            }
-        }
-        targets = _tailscale_targets(status)
-        self.assertIn("100.64.0.12", targets)
-        self.assertIn("2.1.1.70", targets)
-        self.assertNotIn("100.64.0.99", targets)
+    def test_tangled_sprite_has_hair_eyes_and_royal_dress(self):
+        sprite = tangled_sprite(12)
+        self.assertEqual({len(line) for line in sprite}, {17})
+        materials = "".join(sprite)
+        self.assertIn("Y", materials)
+        self.assertIn("E", materials)
+        self.assertIn("S", materials)
+        self.assertIn("P", materials)
+        self.assertIn("H", materials)
 
     def test_dependency_checks_cover_runtime_features(self):
         results = dependency_checks()
