@@ -12,7 +12,7 @@ python3 neon_dojo.py
 
 Use a terminal window at least **72 columns × 23 rows**. A Unicode-capable terminal with a dark background gives the best result.
 
-On the first launch, NEON DOJO checks the Python runtime, terminal graphics, Unicode support, and UDP networking. It shows each check with a progress bar and records successful setup in the user cache. Later launches verify the same requirements silently and open the menu immediately.
+On the first launch, NEON DOJO checks the Python runtime, terminal graphics, Unicode support, and TCP/UDP networking. It shows each check with a progress bar and records successful setup in the user cache. Later launches verify the same requirements silently and open the menu immediately.
 
 If something is unavailable, the setup screen prints the command or configuration needed to fix it. On Windows it automatically installs `windows-curses` with pip when required and streams the installation log. The setup result is stored at `~/.cache/neon-dojo/setup.json` on Linux/macOS or the matching user cache location selected by `XDG_CACHE_HOME`.
 
@@ -22,6 +22,7 @@ If something is unavailable, the setup screen prints the command or configuratio
 |---|---|
 | `←` / `→` or `A` / `D` | Move |
 | `↑` or `W` | Jump |
+| `↓` or `S` | Crouch / sit down |
 | `Z` | Punch |
 | `X` | Kick |
 | `C` | Arc Burst (costs 35 ARC) |
@@ -31,21 +32,31 @@ If something is unavailable, the setup screen prints the command or configuratio
 
 Defeat your opponent in a best-of-three match. Land hits to charge the ARC meter, then use Arc Burst for heavy damage.
 
+Open **Settings** from the main menu to use your operating-system username or save a custom fighter name. The choice is remembered in `~/.config/neon-dojo/settings.json` (or the matching `XDG_CONFIG_HOME` path), and multiplayer opponents see the name you selected.
+
 ## Game modes
 
-- **Single Player** — fight the CPU-controlled Onyx.
-- **Add Server** — host a two-player match as Volt. The game shows the address you can share.
-- **Join Server** — play as Onyx. The game waits and automatically discovers an available server on the same local network.
+- **Single Player** — fight the CPU-controlled Onyx with your selected fighter name.
+- **Add Server** — host a two-player match. The game shows the address you can share.
+- **Join Server** — join with your selected fighter name. The game waits and automatically discovers an available server on the same local network.
 
-For a local multiplayer match, run the game on both computers. One player chooses **Add Server**, then the other chooses **Join Server**. No configuration is normally needed.
+For a local multiplayer match, run the game on both computers. One player chooses **Add Server**, then the other chooses **Join Server**. Discovery starts automatically.
 
-For play over the internet, the host must allow/forward TCP port `48765`. The joining player selects **Join Server**, presses `I`, and enters the host's public address, such as:
+For a routed or WAN match, the host must allow/forward TCP port `48765`. Automatic discovery checks every active IPv4 interface, sends directed LAN broadcasts, probes known online Tailscale peers and their advertised `/24` or smaller subnet routes, and scans this project's `100.64.0.*` tailnet range with UDP. You can still press `I` on **Join Server** and enter the reachable host address manually, such as:
 
 ```text
 203.0.113.10:48765
 ```
 
-Automatic discovery uses UDP port `48766` and works on a LAN. Gameplay uses TCP port `48765` for reliable delivery.
+Discovery uses UDP port `48765`; gameplay uses TCP port `48765`. TCP and UDP can share the same port number. LAN broadcasts do not cross routers, so routed discovery uses unicast probes.
+
+When `hamedvm` runs **Add Server**, the joining player should enter:
+
+```text
+2.1.1.70:48765
+```
+
+This routed TCP path has been verified. If automatic discovery cannot traverse a network's routing or firewall rules, press `I` on the **Join Server** screen to enter the address.
 
 On an asymmetric or routed network, the joining computer may be reachable even when it cannot initiate a connection to the host. In that case:
 
@@ -53,7 +64,7 @@ On an asymmetric or routed network, the joining computer may be reachable even w
 2. The host selects **Add Server**, presses `I`, and enters the waiting player's reachable address.
 3. The host establishes the connection in the working direction while keeping the host/player roles unchanged.
 
-For the `hamedvm` route, enter `2.1.1.70:48765` on the host's **Add Server** screen after the VM is waiting on **Join Server**.
+For the reverse `hamedvm` route, enter `2.1.1.70:48765` on the host's **Add Server** screen after the VM is waiting on **Join Server**.
 
 ## Notes
 

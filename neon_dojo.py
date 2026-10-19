@@ -8,6 +8,8 @@ try:
 except ImportError:
     curses = None  # type: ignore[assignment]
 
+import getpass
+import ipaddress
 import json
 import importlib
 import locale
@@ -29,11 +31,13 @@ MIN_WIDTH = 72
 MIN_HEIGHT = 23
 SPRITE_WIDTH = 17
 GAME_PORT = 48765
-DISCOVERY_PORT = 48766
+DISCOVERY_PORT = GAME_PORT
 PROTOCOL_VERSION = 2
-MENU_ITEMS = ("SINGLE PLAYER", "ADD SERVER", "JOIN SERVER")
+MENU_ITEMS = ("SINGLE PLAYER", "ADD SERVER", "JOIN SERVER", "SETTINGS")
+SETTINGS_ITEMS = ("USE OS USERNAME", "SET CUSTOM NAME", "BACK")
 SETUP_VERSION = 1
 MIN_PYTHON = (3, 10)
+MAX_NAME_LENGTH = 16
 
 
 @dataclass(frozen=True)
@@ -48,6 +52,210 @@ class DependencyResult:
 def setup_cache_path() -> Path:
     cache_root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
     return cache_root / "neon-dojo" / "setup.json"
+
+
+def settings_path() -> Path:
+    config_root = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return config_root / "neon-dojo" / "settings.json"
+
+
+def normalize_character_name(value: object, fallback: str = "PLAYER") -> str:
+    """Return a short, single-line name that is safe to draw and send."""
+    if not isinstance(value, str):
+        return fallback
+    printable = "".join(character if character.isprintable() else " " for character in value)
+    compact = " ".join(printable.split())
+    return compact[:MAX_NAME_LENGTH] or fallback
+
+
+def os_username() -> str:
+    try:
+        return normalize_character_name(getpass.getuser())
+    except (OSError, KeyError):
+        return "PLAYER"
+
+
+@dataclass
+class PlayerSettings:
+    name_source: str = "os"
+    custom_name: str = ""
+
+    @property
+    def character_name(self) -> str:
+        if self.name_source == "custom" and self.custom_name:
+            return normalize_character_name(self.custom_name)
+        return os_username()
+
+
+def load_settings() -> PlayerSettings:
+    try:
+        data = json.loads(settings_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return PlayerSettings()
+    if not isinstance(data, dict):
+        return PlayerSettings()
+    source = data.get("name_source")
+    custom_name = normalize_character_name(data.get("custom_name", ""), "")
+    if source == "custom" and custom_name:
+        return PlayerSettings("custom", custom_name)
+    return PlayerSettings()
+
+
+def save_settings(settings: PlayerSettings) -> bool:
+    path = settings_path()
+    data = {
+        "name_source": settings.name_source,
+        "custom_name": settings.custom_name,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
+@dataclass(frozen=True)
+class IPv4Interface:
+    name: str
+    address: str
+    prefix_length: int
+    broadcast: str
+
+
+def ipv4_interfaces() -> list[IPv4Interface]:
+    """Return active, non-container IPv4 interfaces without extra packages."""
+    interfaces: list[IPv4Interface] = []
+    try:
+        result = subprocess.run(
+            ["ip", "-j", "-4", "address", "show", "up"],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+            check=False,
+        )
+        records = json.loads(result.stdout) if result.returncode == 0 else []
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        records = []
+
+    ignored_prefixes = ("br-", "docker", "veth", "virbr")
+    if isinstance(records, list):
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            name = str(record.get("ifname", ""))
+            if name == "lo" or name.startswith(ignored_prefixes):
+                continue
+            for address_data in record.get("addr_info", []):
+                if not isinstance(address_data, dict) or address_data.get("family") != "inet":
+                    continue
+                address = str(address_data.get("local", ""))
+                try:
+                    prefix_length = int(address_data.get("prefixlen", 24))
+                    network = ipaddress.IPv4Network(f"{address}/{prefix_length}", strict=False)
+                except (ipaddress.AddressValueError, ipaddress.NetmaskValueError, ValueError):
+                    continue
+                broadcast = str(address_data.get("broadcast") or network.broadcast_address)
+                interfaces.append(IPv4Interface(name, address, prefix_length, broadcast))
+
+    if interfaces:
+        return interfaces
+
+    # Portable fallback for systems without Linux's `ip` command.
+    try:
+        addresses = {
+            info[4][0]
+            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+            if info[4][0] != "127.0.0.1"
+        }
+    except OSError:
+        addresses = set()
+    for address in sorted(addresses):
+        try:
+            network = ipaddress.IPv4Network(f"{address}/24", strict=False)
+        except ipaddress.AddressValueError:
+            continue
+        interfaces.append(IPv4Interface("network", address, 24, str(network.broadcast_address)))
+    return interfaces
+
+
+def _tailscale_targets(data: object) -> list[str]:
+    """Expand online peers and bounded subnet routes from Tailscale status."""
+    peers = data.get("Peer", {}) if isinstance(data, dict) else {}
+    if not isinstance(peers, dict):
+        return []
+    addresses: set[str] = set()
+    for peer in peers.values():
+        if not isinstance(peer, dict) or peer.get("Online") is False:
+            continue
+        for address in peer.get("TailscaleIPs", []):
+            try:
+                parsed = ipaddress.ip_address(address)
+            except ValueError:
+                continue
+            if isinstance(parsed, ipaddress.IPv4Address):
+                addresses.add(str(parsed))
+        for route in peer.get("PrimaryRoutes", []):
+            try:
+                network = ipaddress.ip_network(route, strict=False)
+            except ValueError:
+                continue
+            if not isinstance(network, ipaddress.IPv4Network) or network.num_addresses > 256:
+                continue
+            addresses.update(str(address) for address in network.hosts())
+    return sorted(addresses, key=ipaddress.IPv4Address)
+
+
+def tailscale_peer_addresses() -> list[str]:
+    """Read peer and subnet-route targets from the optional Tailscale CLI."""
+    try:
+        result = subprocess.run(
+            ["tailscale", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+            check=False,
+        )
+        data = json.loads(result.stdout) if result.returncode == 0 else {}
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return []
+    return _tailscale_targets(data)
+
+
+def discovery_broadcast_addresses(
+    interfaces: list[IPv4Interface] | None = None,
+) -> list[str]:
+    interfaces = ipv4_interfaces() if interfaces is None else interfaces
+    return list(dict.fromkeys(["255.255.255.255", "127.0.0.1", *(item.broadcast for item in interfaces)]))
+
+
+def discovery_probe_addresses(
+    interfaces: list[IPv4Interface] | None = None,
+    tailscale_peers: list[str] | None = None,
+) -> list[str]:
+    """Build LAN broadcasts and bounded unicast probes for routed overlays."""
+    interfaces = ipv4_interfaces() if interfaces is None else interfaces
+    tailscale_peers = tailscale_peer_addresses() if tailscale_peers is None else tailscale_peers
+    targets = discovery_broadcast_addresses(interfaces)
+    targets.extend(tailscale_peers)
+    for interface in interfaces:
+        try:
+            # Scan at most one /24 per interface to keep discovery bounded on
+            # large corporate, VPN, and container networks.
+            prefix_length = max(24, interface.prefix_length)
+            network = ipaddress.IPv4Network(
+                f"{interface.address}/{prefix_length}",
+                strict=False,
+            )
+        except (ipaddress.AddressValueError, ipaddress.NetmaskValueError):
+            continue
+        targets.extend(str(address) for address in network.hosts())
+
+    # Tailscale is layer 3 and does not carry broadcasts. This project's
+    # tailnet uses 100.64.0.0/24, so probe that bounded range with unicast.
+    targets.extend(str(address) for address in ipaddress.IPv4Network("100.64.0.0/24").hosts())
+    local_addresses = {item.address for item in interfaces}
+    return [address for address in dict.fromkeys(targets) if address not in local_addresses]
 
 
 def dependency_signature() -> dict[str, object]:
@@ -303,6 +511,9 @@ class Fighter:
         elif self.action == "walk" and self.action_time >= 0.12:
             self.action = "idle"
             self.action_time = 0.0
+        elif self.action == "crouch" and self.action_time >= 0.45:
+            self.action = "idle"
+            self.action_time = 0.0
         elif self.action == "hurt" and self.hitstun <= 0:
             self.action = "idle"
 
@@ -345,6 +556,9 @@ class Game:
     mode: str = "single"
     network_status: str = ""
     server_address: str = ""
+    settings: PlayerSettings = field(default_factory=PlayerSettings)
+    settings_index: int = 0
+    settings_message: str = ""
 
     def start_match(self, width: int) -> None:
         self.player.wins = 0
@@ -413,7 +627,7 @@ class Game:
             self.player.facing, self.enemy.facing = -1, 1
 
     def move(self, fighter: Fighter, direction: int, dt: float) -> None:
-        if self.state != "fight" or fighter.hitstun > 0 or fighter.blocking:
+        if self.state != "fight" or fighter.hitstun > 0 or fighter.blocking or fighter.action == "crouch":
             return
         speed = 30.0 if not fighter.airborne else 22.0
         fighter.x += direction * speed * max(dt, 1 / FPS)
@@ -433,6 +647,11 @@ class Game:
             fighter.block_time = 0.22
             if fighter.action in ("idle", "walk"):
                 fighter.action = "idle"
+
+    def crouch(self, fighter: Fighter) -> None:
+        if self.state == "fight" and fighter.hitstun <= 0 and not fighter.airborne:
+            fighter.action = "crouch"
+            fighter.action_time = 0.0
 
     def resolve_attack(self, attacker: Fighter, defender: Fighter) -> None:
         if attacker.action not in ATTACKS or attacker.action_hit:
@@ -494,10 +713,10 @@ class Game:
             self.banner = "DRAW"
         elif self.player.health > self.enemy.health:
             self.player.wins += 1
-            self.banner = "VOLT WINS"
+            self.banner = f"{self.player.name} WINS"
         else:
             self.enemy.wins += 1
-            self.banner = "ONYX WINS"
+            self.banner = f"{self.enemy.name} WINS"
         self.state = "round_over"
         self.state_time = 0.0
 
@@ -507,7 +726,8 @@ class Game:
         if self.player.wins >= 2 or self.enemy.wins >= 2:
             self.state = "match_over"
             self.state_time = 0.0
-            self.banner = "CHAMPION: VOLT" if self.player.wins > self.enemy.wins else "CHAMPION: ONYX"
+            champion = self.player.name if self.player.wins > self.enemy.wins else self.enemy.name
+            self.banner = f"CHAMPION: {champion}"
         else:
             self.round_number += 1
             self.start_round(width)
@@ -598,6 +818,13 @@ def local_ip_address() -> str:
         probe.close()
 
 
+def local_server_addresses() -> str:
+    addresses = list(dict.fromkeys(item.address for item in ipv4_interfaces()))
+    if not addresses:
+        addresses = [local_ip_address()]
+    return " / ".join(f"{address}:{GAME_PORT}" for address in addresses)
+
+
 def parse_server_address(value: str) -> tuple[str, int]:
     value = value.strip()
     if not value:
@@ -621,8 +848,9 @@ class NetworkSession:
     the waiting player with ``invite_player``.
     """
 
-    def __init__(self, role: str) -> None:
+    def __init__(self, role: str, player_name: str = "PLAYER") -> None:
         self.role = role
+        self.player_name = normalize_character_name(player_name)
         self.peer: tuple[str, int] | None = None
         self.last_send = 0.0
         self.last_seen = time.monotonic()
@@ -632,13 +860,18 @@ class NetworkSession:
         self.connection_lost = False
         self.receive_buffer = bytearray()
         self.send_buffer = bytearray()
+        self.discovery_targets: list[str] = []
+        self.discovery_broadcasts = discovery_broadcast_addresses()
+        self.discovery_cursor = 0
+        self.last_discovery_cycle = time.monotonic()
 
         self.discovery = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.discovery.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.discovery.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        if role == "client":
-            self.discovery.bind(("0.0.0.0", DISCOVERY_PORT))
+        self.discovery.bind(("0.0.0.0", DISCOVERY_PORT))
         self.discovery.setblocking(False)
+        if role == "client":
+            self.discovery_targets = discovery_probe_addresses()
 
         self.listener: socket.socket | None = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -659,6 +892,28 @@ class NetworkSession:
             self.discovery.sendto(encoded, address)
         except (OSError, TypeError, ValueError):
             pass
+
+    def _announcement(self) -> dict[str, object]:
+        return {
+            "v": PROTOCOL_VERSION,
+            "t": "announce",
+            "port": GAME_PORT,
+            "id": self.session_id,
+        }
+
+    def _send_discovery_probes(self, now: float) -> None:
+        if self.role != "client" or self.connection is not None:
+            return
+        if self.discovery_cursor >= len(self.discovery_targets):
+            if now - self.last_discovery_cycle < 2.0:
+                return
+            self.discovery_cursor = 0
+            self.last_discovery_cycle = now
+        probe = {"v": PROTOCOL_VERSION, "t": "discover"}
+        stop = min(len(self.discovery_targets), self.discovery_cursor + 32)
+        for address in self.discovery_targets[self.discovery_cursor:stop]:
+            self._send_discovery(probe, (address, DISCOVERY_PORT))
+        self.discovery_cursor = stop
 
     def _queue(self, payload: dict[str, object]) -> None:
         if self.connection is None:
@@ -707,7 +962,7 @@ class NetworkSession:
             raise ValueError("only a joining player can connect to a server")
         address = parse_server_address(value)
         self._connect(address)
-        self._queue({"v": PROTOCOL_VERSION, "t": "join"})
+        self._queue({"v": PROTOCOL_VERSION, "t": "join", "name": self.player_name})
         return f"Connecting to {address[0]}:{address[1]}"
 
     def invite_player(self, value: str) -> str:
@@ -740,12 +995,10 @@ class NetworkSession:
                 continue
             self._set_connection(connection, address)
             if self.role == "client":
-                self._queue({"v": PROTOCOL_VERSION, "t": "join"})
+                self._queue({"v": PROTOCOL_VERSION, "t": "join", "name": self.player_name})
                 events.append("found")
 
     def _poll_discovery(self, events: list[str]) -> None:
-        if self.role != "client" or self.connection is not None:
-            return
         while True:
             try:
                 packet, address = self.discovery.recvfrom(8192)
@@ -755,16 +1008,27 @@ class NetworkSession:
                 break
             try:
                 data = json.loads(packet.decode("utf-8"))
-                port = int(data.get("port", GAME_PORT))
-            except (UnicodeDecodeError, json.JSONDecodeError, AttributeError, TypeError, ValueError):
+            except (UnicodeDecodeError, json.JSONDecodeError):
                 continue
-            if data.get("v") != PROTOCOL_VERSION or data.get("t") != "announce" or not (1 <= port <= 65535):
+            if not isinstance(data, dict) or data.get("v") != PROTOCOL_VERSION:
+                continue
+            kind = data.get("t")
+            if kind == "discover" and self.role == "host" and self.connection is None:
+                self._send_discovery(self._announcement(), address)
+                continue
+            if kind != "announce" or self.role != "client" or self.connection is not None:
+                continue
+            try:
+                port = int(data.get("port", GAME_PORT))
+            except (TypeError, ValueError):
+                continue
+            if not (1 <= port <= 65535):
                 continue
             try:
                 self._connect((address[0], port))
             except OSError:
                 continue
-            self._queue({"v": PROTOCOL_VERSION, "t": "join"})
+            self._queue({"v": PROTOCOL_VERSION, "t": "join", "name": self.player_name})
             events.append("found")
             break
 
@@ -800,6 +1064,7 @@ class NetworkSession:
             kind = data.get("t")
             if self.role == "host":
                 if kind == "join" and not self.connected:
+                    game.enemy.name = normalize_character_name(data.get("name", "PLAYER"))
                     self.connected = True
                     events.append("joined")
                 elif kind == "input" and isinstance(data.get("key"), str):
@@ -839,21 +1104,18 @@ class NetworkSession:
         events: list[str] = []
         if self.role == "host":
             if self.connection is None and now - self.last_send >= 0.75:
-                announcement = {
-                    "v": PROTOCOL_VERSION,
-                    "t": "announce",
-                    "port": GAME_PORT,
-                    "id": self.session_id,
-                }
-                self._send_discovery(announcement, ("255.255.255.255", DISCOVERY_PORT))
-                self._send_discovery(announcement, ("127.0.0.1", DISCOVERY_PORT))
+                announcement = self._announcement()
+                for address in self.discovery_broadcasts:
+                    self._send_discovery(announcement, (address, DISCOVERY_PORT))
                 self.last_send = now
             elif self.connected and now - self.last_send >= 1 / 20:
                 self._queue({"v": PROTOCOL_VERSION, "t": "state", "game": game_to_data(game)})
                 self.last_send = now
-        elif self.connection and now - self.last_send >= 0.5:
-            self._queue({"v": PROTOCOL_VERSION, "t": "ping"})
-            self.last_send = now
+        else:
+            self._send_discovery_probes(now)
+            if self.connection and now - self.last_send >= 0.5:
+                self._queue({"v": PROTOCOL_VERSION, "t": "ping"})
+                self.last_send = now
         self._flush()
         if self.connection and now - self.last_seen > 7.0:
             events.append("timeout")
@@ -995,6 +1257,15 @@ def fighter_sprite(f: Fighter, tick: int) -> list[str]:
             "     m m",
             "    BB BB",
         ),
+        "crouch": _frame(
+            "    RRR",
+            "   RRRR",
+            "    MMMMM",
+            " HHMMFOFMM  SS",
+            " HEHMMMMMMGSS",
+            " HHH mMMm",
+            "    BB BB",
+        ),
         "hurt": _frame(
             " RRR",
             "  RRRR        S",
@@ -1074,6 +1345,10 @@ class Renderer:
             self.draw_title(game, width, height, tick)
             self.win.refresh()
             return
+        if game.state == "settings":
+            self.draw_settings(game, width, height, tick)
+            self.win.refresh()
+            return
         if game.state in ("hosting", "searching"):
             self.draw_network_lobby(game, width, height, tick)
             self.win.refresh()
@@ -1139,11 +1414,13 @@ class Renderer:
     def draw_hud(self, game: Game, width: int) -> None:
         bar_width = max(14, min(32, (width - 24) // 2))
         timer = f"{math.ceil(game.round_time):02d}"
-        safe_add(self.win, 0, 2, " VOLT ", self.c(1, True))
-        safe_add(self.win, 0, width - 9, " ONYX ", self.c(3, True))
+        player_label = f" {game.player.name} "
+        enemy_label = f" {game.enemy.name} "
+        safe_add(self.win, 0, 2, player_label, self.c(game.player.color, True))
+        safe_add(self.win, 0, width - 2 - len(enemy_label), enemy_label, self.c(game.enemy.color, True))
         safe_add(self.win, 0, (width - 10) // 2, f"◢ {timer} ◣", self.c(4, True))
-        safe_add(self.win, 1, 2, bar(game.player.health, 100, bar_width), self.c(7 if game.player.health > 25 else 5, True))
-        safe_add(self.win, 1, width - 2 - bar_width, bar(game.enemy.health, 100, bar_width, False), self.c(7 if game.enemy.health > 25 else 5, True))
+        safe_add(self.win, 1, 2, bar(game.player.health, 100, bar_width), self.c(game.player.color, True))
+        safe_add(self.win, 1, width - 2 - bar_width, bar(game.enemy.health, 100, bar_width, False), self.c(game.enemy.color, True))
         safe_add(self.win, 2, 2, "◆" * game.player.wins + "◇" * (2 - game.player.wins), self.c(1, True))
         safe_add(self.win, 2, width - 4, "◇" * (2 - game.enemy.wins) + "◆" * game.enemy.wins, self.c(3, True))
         meter_w = max(10, bar_width - 6)
@@ -1217,7 +1494,7 @@ class Renderer:
                 text = f"{f.combo} HIT COMBO"
                 x = 3 if side == 1 else width - len(text) - 3
                 safe_add(self.win, 5, x, text, self.c(f.color, True))
-        safe_add(self.win, height - 1, 1, "← → move  ↑ jump  Z punch  X kick  C arc  SPACE block  P pause  Q quit", self.c(1, dim=True))
+        safe_add(self.win, height - 1, 1, "← → move  ↑ jump  ↓ crouch  Z punch  X kick  C arc  SPACE block  P pause  Q quit", self.c(1, dim=True))
 
     def draw_title(self, game: Game, width: int, height: int, tick: int) -> None:
         logo = [
@@ -1240,8 +1517,30 @@ class Renderer:
                 attr |= curses.A_REVERSE
             safe_add(self.win, start_y + 8 + index, (width - len(label)) // 2, label, attr)
         hint = "↑ ↓ SELECT   ENTER CONFIRM   Q QUIT"
-        safe_add(self.win, start_y + 12, (width - len(hint)) // 2, hint, self.c(1, dim=True))
+        safe_add(self.win, start_y + 13, (width - len(hint)) // 2, hint, self.c(1, dim=True))
         safe_add(self.win, height - 2, (width - 39) // 2, "Solo · LAN discovery · direct WAN address", self.c(6, dim=True))
+
+    def draw_settings(self, game: Game, width: int, height: int, tick: int) -> None:
+        title = "PLAYER SETTINGS"
+        safe_add(self.win, 4, (width - len(title)) // 2, title, self.c(2, True))
+        current = f"FIGHTER NAME: {game.settings.character_name}"
+        source = "OS USERNAME" if game.settings.name_source == "os" else "CUSTOM NAME"
+        source_line = f"SOURCE: {source}"
+        safe_add(self.win, 6, (width - len(current)) // 2, current, self.c(4, True))
+        safe_add(self.win, 7, (width - len(source_line)) // 2, source_line, self.c(1, dim=True))
+        for index, item in enumerate(SETTINGS_ITEMS):
+            selected = index == game.settings_index
+            if index == 0:
+                item = f"{item}: {os_username()}"
+            label = f"▶ {item} ◀" if selected else f"  {item}  "
+            attr = self.c(3 if selected else 1, True)
+            if selected and tick % 20 < 10:
+                attr |= curses.A_REVERSE
+            safe_add(self.win, 10 + index * 2, (width - len(label)) // 2, label, attr)
+        if game.settings_message:
+            safe_add(self.win, 17, (width - len(game.settings_message)) // 2, game.settings_message, self.c(7, True))
+        hint = "↑ ↓ SELECT   ENTER CONFIRM   ESC BACK"
+        safe_add(self.win, height - 2, (width - len(hint)) // 2, hint, self.c(1, dim=True))
 
     def draw_network_lobby(self, game: Game, width: int, height: int, tick: int) -> None:
         hosting = game.state == "hosting"
@@ -1266,10 +1565,10 @@ class Renderer:
         else:
             dots = "." * (1 + (tick // 10) % 3)
             heading = "SCANNING FOR SERVERS" + dots
-            status = game.network_status or "Searching your local network"
+            status = game.network_status or "Scanning IPv4 networks and Tailscale"
             safe_add(self.win, 9, (width - len(heading)) // 2, heading, self.c(3, True))
             safe_add(self.win, 11, (width - len(status)) // 2, status, self.c(1))
-            direct = "Press I to enter a WAN / direct IP address"
+            direct = "Press I to enter or retry a routed / WAN address"
             safe_add(self.win, 13, (width - len(direct)) // 2, direct, self.c(4, True))
         cancel = "ESC  BACK TO MENU"
         safe_add(self.win, 17, (width - len(cancel)) // 2, cancel, self.c(1, dim=True))
@@ -1322,6 +1621,8 @@ def control_from_key(key: int) -> str | None:
         return "right"
     if key in (curses.KEY_UP, ord("w"), ord("W")):
         return "jump"
+    if key in (curses.KEY_DOWN, ord("s"), ord("S")):
+        return "crouch"
     if key in (ord("z"), ord("Z")):
         return "punch"
     if key in (ord("x"), ord("X")):
@@ -1344,6 +1645,8 @@ def apply_control(game: Game, fighter: Fighter, command: str, dt: float) -> None
         fighter.start_attack(command)
     elif command == "block":
         game.block(fighter)
+    elif command == "crouch":
+        game.crouch(fighter)
 
 
 def handle_input(
@@ -1375,11 +1678,32 @@ def handle_input(
             elif key in (10, 13, curses.KEY_ENTER):
                 if game.menu_index == 0:
                     game.mode = "single"
+                    game.player.name = game.settings.character_name
+                    game.enemy.name = "ONYX"
                     game.start_match(width)
                 elif game.menu_index == 1:
                     app_command = "host"
-                else:
+                elif game.menu_index == 2:
                     app_command = "join"
+                else:
+                    game.state = "settings"
+                    game.settings_index = 0
+                    game.settings_message = ""
+            continue
+        if game.state == "settings":
+            if key == 27:
+                game.state = "title"
+            elif key in (curses.KEY_UP, ord("w"), ord("W")):
+                game.settings_index = (game.settings_index - 1) % len(SETTINGS_ITEMS)
+            elif key in (curses.KEY_DOWN, ord("s"), ord("S")):
+                game.settings_index = (game.settings_index + 1) % len(SETTINGS_ITEMS)
+            elif key in (10, 13, curses.KEY_ENTER):
+                if game.settings_index == 0:
+                    app_command = "use_os_name"
+                elif game.settings_index == 1:
+                    app_command = "custom_name"
+                else:
+                    game.state = "title"
             continue
         if game.state in ("hosting", "searching"):
             if key == 27:
@@ -1445,7 +1769,8 @@ def run(win: curses.window) -> None:
     win.nodelay(True)
     win.keypad(True)
     renderer = Renderer(win)
-    game = Game(Fighter("VOLT", 18, 2), Fighter("ONYX", 55, 3, facing=-1))
+    settings = load_settings()
+    game = Game(Fighter(settings.character_name, 18, 2), Fighter("ONYX", 55, 3, facing=-1), settings=settings)
     last = time.monotonic()
     tick = 0
     running = True
@@ -1459,7 +1784,18 @@ def run(win: curses.window) -> None:
             role = network.role if network else "single"
             running, app_command, outgoing = handle_input(win, game, dt, width, role)
 
-            if app_command == "menu":
+            if app_command == "use_os_name":
+                game.settings.name_source = "os"
+                game.player.name = game.settings.character_name
+                game.settings_message = "OS username selected" if save_settings(game.settings) else "Could not save settings"
+            elif app_command == "custom_name":
+                name = prompt_server_address(win, "Character name: ")
+                if name:
+                    game.settings.custom_name = normalize_character_name(name)
+                    game.settings.name_source = "custom"
+                    game.player.name = game.settings.character_name
+                    game.settings_message = "Custom name saved" if save_settings(game.settings) else "Could not save settings"
+            elif app_command == "menu":
                 if network:
                     network.close()
                     network = None
@@ -1471,16 +1807,18 @@ def run(win: curses.window) -> None:
                     network.close()
                 try:
                     network_role = "host" if app_command == "host" else "client"
-                    network = NetworkSession(network_role)
+                    game.player.name = game.settings.character_name
+                    game.enemy.name = "PLAYER"
+                    network = NetworkSession(network_role, game.settings.character_name)
                     if app_command == "host":
                         game.mode = "host"
                         game.state = "hosting"
                         game.network_status = "Waiting for another knight"
-                        game.server_address = f"{local_ip_address()}:{GAME_PORT}"
+                        game.server_address = local_server_addresses()
                     else:
                         game.mode = "client"
                         game.state = "searching"
-                        game.network_status = "Searching your local network"
+                        game.network_status = "Scanning IPv4 networks and Tailscale"
                 except OSError as error:
                     network = None
                     game.state = "hosting" if app_command == "host" else "searching"
@@ -1519,7 +1857,7 @@ def run(win: curses.window) -> None:
                     game.network_status = "Connected"
                 elif event == "busy":
                     game.state = "searching"
-                    game.network_status = "Server was busy — searching again"
+                    game.network_status = "Server was busy — scanning again"
                 elif event == "left" and network and network.role == "host":
                     network.reset_peer()
                     game.state = "hosting"
@@ -1527,7 +1865,7 @@ def run(win: curses.window) -> None:
                 elif event == "left" and network and network.role == "client":
                     network.reset_peer()
                     game.state = "searching"
-                    game.network_status = "Host left — searching again"
+                    game.network_status = "Host left — scanning again"
 
             if width >= MIN_WIDTH and height >= MIN_HEIGHT:
                 if network is None:
@@ -1545,7 +1883,7 @@ def run(win: curses.window) -> None:
                 else:
                     network.reset_peer()
                     game.state = "searching"
-                    game.network_status = "Connection lost — searching again"
+                    game.network_status = "Connection lost — scanning again"
 
             renderer.draw(game, tick)
             tick += 1
