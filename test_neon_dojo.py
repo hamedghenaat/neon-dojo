@@ -135,7 +135,7 @@ class CombatTests(unittest.TestCase):
 
     def test_tangled_sprite_has_hair_eyes_and_royal_dress(self):
         sprite = tangled_sprite(12)
-        self.assertEqual({len(line) for line in sprite}, {17})
+        self.assertEqual({len(line) for line in sprite}, {9})
         materials = "".join(sprite)
         self.assertIn("Y", materials)
         self.assertIn("E", materials)

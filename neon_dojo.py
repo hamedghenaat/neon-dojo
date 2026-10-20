@@ -880,19 +880,17 @@ def tangled_sprite(tick: int) -> list[str]:
     Y/y = golden hair, F = face, E = green eyes, N/S = nose/smile,
     P/p = purple dress, and H = the pink bodice detail.
     """
-    eyes = " yYYFFFFFFFFFYYy " if tick % 90 in (0, 1, 2, 3) else " yYYFFEFFFEFFYYy "
+    eyes = " YFFFFFY " if tick % 90 in (0, 1, 2, 3) else " YFEFEFY "
     return [
-        "     yYYYYYy     ",
-        "   yYYYYYYYYYy   ",
-        "  yYYFFFFFFFYYy  ",
+        "   YYY   ",
+        "  yYYYYy ",
+        " yYFFFYy ",
         eyes,
-        " yYYFFFFNFFFFYYy ",
-        "  YYFFFFSFFFFYY  ",
-        "   YYYFFFFFYYY   ",
-        "   YYpPPHPPpYY   ",
-        "   YYFPPHPPFYY   ",
-        "    YYPPPPPYY    ",
-        "    PPPPPPPPP    ",
+        " YFFNFFY ",
+        " yFFSFFy ",
+        "  pPHPp  ",
+        "  FPPPF  ",
+        "   PPP   ",
     ]
 
 
@@ -997,18 +995,18 @@ class Renderer:
                 safe_add(self.win, y, vine_x, "│" if (y + tick // 10) % 2 else "╵", self.c(7, dim=True))
 
         castle = (
-            "             /\\             ",
-            "        ____/  \\____        ",
-            "       /   TANGLED   \\       ",
-            "  ____|╔════════════╗|____  ",
-            " | [] |║            ║| [] | ",
-            " |    |║            ║|    | ",
-            " | [] |║            ║| [] | ",
-            " |    |║            ║|    | ",
-            " | [] |╚════════════╝| [] | ",
-            " |    |      ██      |    | ",
-            " | [] |      ██      | [] | ",
-            " |____|______██______|____| ",
+            "                    /\\                    ",
+            "             ______/  \\______             ",
+            "            /      TANGLED      \\            ",
+            "       ____|╔══════════════════╗|____       ",
+            "  ____| [] |║                  ║| [] |____  ",
+            " | [] |    |║                  ║|    | [] | ",
+            " |    | [] |║                  ║| [] |    | ",
+            " | [] |    |║                  ║|    | [] | ",
+            " |    | [] |╚══════════════════╝| [] |    | ",
+            " | [] |    |        ██        |    | [] | ",
+            " |    | [] |        ██        | [] |    | ",
+            " |____|____|________██________|____|____| ",
         )
         castle_width = max(map(len, castle))
         castle_x = (width - castle_width) // 2 + ox
@@ -1021,10 +1019,11 @@ class Renderer:
         center = width // 2 + ox
         married = game.state == "match_over" or (game.state == "wedding" and game.state_time >= 4.4)
         tangled_center = center + (3 if married else 0)
-        self.draw_tangled(tangled_center, castle_y + 1, base, tick)
+        self.draw_tangled(tangled_center, castle_y + 3, base, tick)
         if married:
             self.draw_window_knight(game, center - 7, castle_y + 4)
-            self.draw_wedding_heart(center + castle_width // 2 + 8, castle_y + 3, tick)
+            heart_center = min(width - 7, center + castle_width // 2 + 7)
+            self.draw_wedding_heart(heart_center, castle_y + 3, tick)
 
         # Grass and roots replace the old neon grid floor.
         grass = "".join("♣" if (col + tick // 8) % 7 == 0 else "━" for col in range(width - 1))
@@ -1039,7 +1038,7 @@ class Renderer:
         glyphs = {
             "Y": "▓",  # long golden hair
             "y": "▒",  # golden highlights
-            "F": "░",  # face and hands
+            "F": "█",  # bright white face and hands
             "E": "●",  # green eyes
             "N": "·",  # small nose
             "S": "⌣",  # smile
