@@ -21,6 +21,11 @@ Run any of these files directly from your terminal:
 All three include single player, Add Server, Join Server, player settings, combat,
 round finishers, and the castle wedding story. The graphical editions share the
 same controller and 400×240 scene so you can compare the rendering engines.
+Their colorful Pixel Platformer presentation uses bundled Kenney CC0 environment
+tiles, drifting clouds, layered forest scenery, a stone castle with purple roofs,
+and larger knights. Both engines intentionally use the same artwork; pygame-ce
+renders RGBA directly and Pyxel maps it into its palette. The original editable
+character sprites remain available for further work in Aseprite.
 Both graphical versions require a desktop display; the terminal edition works
 in a terminal or SSH session. Controls are listed below.
 
@@ -127,4 +132,6 @@ For the reverse `hamedvm` route, enter `2.1.1.70:48765` on the host's **Add Serv
 
 ## License
 
-NEON DOJO is available under the [MIT License](LICENSE).
+NEON DOJO code and original character artwork are available under the
+[MIT License](LICENSE). Bundled Kenney environment tiles are provided under
+[CC0](assets/platformer/README.md).

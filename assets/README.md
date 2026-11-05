@@ -4,7 +4,9 @@ All three frontends share these original RGBA pixel characters. Each character
 has a lossless `.png` sprite sheet, an Aseprite JSON-array export with frame
 rectangles/timing/tags, and an editable `.aseprite` source document. The source
 contains a visible Character layer, compressed RGBA cels, and named animation
-tags. There are no downloaded third-party sprite files.
+tags. The character sprites are original project artwork. The graphical editions
+also use [Kenney Pixel Platformer environment tiles](platformer/README.md),
+bundled separately under CC0.
 
 ## Rebuild the original artwork
 

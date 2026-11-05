@@ -77,9 +77,10 @@ class Canvas:
                         self.rect(x + (index * 4 + col) * scale, y + row * scale, scale, scale, color)
 
     def sprite(self, name, action, x, y, flip=False, scale=1, tick=0):
-        from sprite_assets import ASSET_DIR, frame_info
+        from sprite_assets import frame_info, load_sheet
         if name not in self.sheets:
-            self.sheets[name] = self.pg.image.load(str(ASSET_DIR / f'{name}.png')).convert_alpha()
+            image, _ = load_sheet(name)
+            self.sheets[name] = self.pg.image.frombytes(image.tobytes(), image.size, 'RGBA').convert_alpha()
         frame = frame_info(name, action, tick)
         key = (name, frame['x'], frame['y'], frame['w'], frame['h'], flip, scale)
         if key not in self.frames:

@@ -11,11 +11,26 @@ except ImportError:
     Image = None
 
 from build_sprite_assets import ACTIONS, build
-from sprite_assets import ASSET_DIR, SHEET_NAMES, frame_image, frame_info, load_sheet
+from sprite_assets import ASSET_DIR, PLATFORMER_TILES, SHEET_NAMES, frame_image, frame_info, load_sheet
 
 
 @unittest.skipUnless(Image is not None, 'Pillow is optional for the original stdlib game')
 class SpriteAssetTests(unittest.TestCase):
+    def test_environment_tiles_are_valid_nonempty_crops(self):
+        sheet, _ = load_sheet('platformer')
+        self.assertEqual(sheet.mode, 'RGBA')
+        for name in PLATFORMER_TILES:
+            with self.subTest(tile=name):
+                frame = frame_info('platformer', name)
+                self.assertGreaterEqual(frame['x'], 0)
+                self.assertGreaterEqual(frame['y'], 0)
+                self.assertLessEqual(frame['x'] + frame['w'], sheet.width)
+                self.assertLessEqual(frame['y'] + frame['h'], sheet.height)
+                tile = frame_image('platformer', name)
+                self.assertEqual(tile.size, (18, 18))
+                self.assertIsNotNone(tile.getbbox())
+        self.assertEqual(frame_image('platformer', 'cloud_left').getchannel('A').getextrema(), (0, 255))
+
     def test_all_actions_have_exported_frames_and_transparent_pixels(self):
         for name in SHEET_NAMES:
             sheet, data = load_sheet(name)
