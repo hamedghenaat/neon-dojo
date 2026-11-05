@@ -1,0 +1,74 @@
+{
+  "frames": [
+    {
+      "filename": "idle_0",
+      "frame": {
+        "x": 0,
+        "y": 0,
+        "w": 9,
+        "h": 14
+      },
+      "rotated": false,
+      "trimmed": false,
+      "spriteSourceSize": {
+        "x": 0,
+        "y": 0,
+        "w": 9,
+        "h": 14
+      },
+      "sourceSize": {
+        "w": 9,
+        "h": 14
+      },
+      "duration": 3500
+    },
+    {
+      "filename": "idle_1",
+      "frame": {
+        "x": 9,
+        "y": 0,
+        "w": 9,
+        "h": 14
+      },
+      "rotated": false,
+      "trimmed": false,
+      "spriteSourceSize": {
+        "x": 0,
+        "y": 0,
+        "w": 9,
+        "h": 14
+      },
+      "sourceSize": {
+        "w": 9,
+        "h": 14
+      },
+      "duration": 133
+    }
+  ],
+  "meta": {
+    "app": "Neon Dojo original-art exporter",
+    "version": "1",
+    "image": "princess.png",
+    "format": "RGBA8888",
+    "size": {
+      "w": 18,
+      "h": 14
+    },
+    "scale": "1",
+    "frameTags": [
+      {
+        "name": "idle",
+        "from": 0,
+        "to": 1,
+        "direction": "forward"
+      }
+    ],
+    "layers": [
+      {
+        "name": "Character",
+        "opacity": 255,
+        "blendMode": "normal"
+      }
+    ]
+  }
+}

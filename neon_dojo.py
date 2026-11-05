@@ -22,6 +22,11 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from sprites import (
+    PixelRenderer, PRINCESS_MATERIALS, balcony_knight_pixels,
+    knight_materials, knight_pixels, princess_pixels,
+)
+
 from networking import (
     NetworkSession,
     apply_game_data,
@@ -701,203 +706,21 @@ def mirrored(lines: list[str]) -> list[str]:
     return [line.translate(swap)[::-1] for line in lines]
 
 
-def _frame(*lines: str) -> list[str]:
-    """Normalize a color-coded terminal sprite to one stable cell grid."""
-    return [line.ljust(SPRITE_WIDTH)[:SPRITE_WIDTH] for line in lines]
-
-
 def fighter_sprite(f: Fighter, tick: int) -> list[str]:
-    """Return a tiny knight pose encoded as material/color cells.
-
-    M/m = armor, R = plume, F = face, O = eye, H/E = shield/emblem,
-    S/G = sword/guard, B = boots, and A = arc energy.
-    """
-    idle_a = _frame(
-        "    RRR",
-        "   RRRR     SS",
-        "    MMMMM  SS",
-        "   MMFOFMMSS",
-        " HHMMMMMMG",
-        " HEH mMMG",
-        " HHH mMm",
-        "     m m",
-        "    BB BB",
-    )
-    idle_b = _frame(
-        "     RRR",
-        "    RRRR    SS",
-        "    MMMMM  SS",
-        "   MMFOFMMSS",
-        " HHMMMMMMG",
-        " HEH mMMG",
-        " HHH mMm",
-        "    m   m",
-        "   BB   BB",
-    )
-    poses = {
-        # A short sword jab reads as the quick punch attack.
-        "punch": _frame(
-            "    RRR",
-            "   RRRR",
-            "    MMMMM",
-            "   MMFOFMM GSSSSS",
-            " HHMMMMMMMG",
-            " HEH mMMM",
-            " HHH mMm",
-            "     m m",
-            "    BB BB",
-        ),
-        "kick": _frame(
-            "    RRR",
-            "   RRRR     SS",
-            "    MMMMM  SS",
-            "   MMFOFMMSS",
-            " HHMMMMMMG",
-            " HEH mMMG",
-            " HHH mMm",
-            "    m  mMMMM",
-            "   BB",
-        ),
-        "special": _frame(
-            "    RRR       A",
-            "   RRRR    S AA",
-            "    MMMMM S AAA",
-            "   MMFOFMMSAAAAA",
-            " HHMMMMMMG AAAAA",
-            " HEH mMMG   AAA",
-            " HHH mMm     A",
-            "     m m",
-            "    BB BB",
-        ),
-        "block": _frame(
-            "    RRR",
-            "   RRRR",
-            "    MMMMM",
-            "   MMFOFMM HHH",
-            "   MMMMMMM HEH",
-            "    mMMm  HHH",
-            "    mMMm",
-            "     m m",
-            "    BB BB",
-        ),
-        "crouch": _frame(
-            "    RRR",
-            "   RRRR",
-            "    MMMMM",
-            " HHMMFOFMM  SS",
-            " HEHMMMMMMGSS",
-            " HHH mMMm",
-            "    BB BB",
-        ),
-        "hurt": _frame(
-            " RRR",
-            "  RRRR        S",
-            "   MMMMM     S",
-            "  MMOFOMM   S",
-            " HHMMMMMM  G",
-            " HEH mMMm G",
-            " HHH  mMm",
-            "      m m",
-            "     BB BB",
-        ),
-        "jump": _frame(
-            "    RRR",
-            "   RRRR     SS",
-            "    MMMMM  SS",
-            "   MMFOFMMSS",
-            " HHMMMMMMG",
-            " HEH mMMG",
-            " HHH mMm",
-            "    mBmB",
-            "     BB",
-        ),
-        "defeated": _frame(
-            "      RRR",
-            "     RRRR",
-            "      MMMMM",
-            "     MMOFOMM",
-            "   HHMMMMMM",
-            "   HEH mMMm",
-            "   HHH mMm",
-            "      m m",
-            "     BB BB",
-        ),
-        "finish": _frame(
-            "    RRR       S",
-            "   RRRR      S",
-            "    MMMMM   S",
-            "   MMFOFMM S",
-            " HHMMMMMMMG",
-            " HEH mMMM",
-            " HHH mMm",
-            "     m m",
-            "    BB BB",
-        ),
-        "victory": _frame(
-            "    RRR    SS",
-            "   RRRR  SS",
-            "    MMMMMS",
-            "   MMFOFMG",
-            " HHMMMMMMM",
-            " HEH mMMm",
-            " HHH mMm",
-            "     m m",
-            "    BB BB",
-        ),
-        "fallen": _frame(
-            "",
-            "",
-            "",
-            "",
-            "",
-            "",
-            " RRR       SS",
-            "HHMMMMMMMMG",
-            "HEH BB BB",
-        ),
-        "climb": _frame(
-            "     RRR",
-            "    RRRR",
-            "     MMMMM",
-            "    MMFOFMM",
-            "   HHMMMMMM",
-            "   HEH mMMm",
-            "   HHH mMm",
-            "      m m",
-            "     BB BB",
-        ),
-        "walk": idle_b if tick % 2 else idle_a,
-        "idle": idle_b if (tick // 12) % 2 else idle_a,
-    }
-    key = "block" if f.blocking else f.action
-    lines = poses.get(key, idle_a)
-    return lines if f.facing == 1 else [line[::-1] for line in lines]
+    """Return square source pixels; two source rows form one terminal row."""
+    action = "block" if f.blocking else f.action
+    return knight_pixels(action, tick, f.facing)
 
 
 def tangled_sprite(tick: int) -> list[str]:
-    """Return Tangled as a compact pixel-art princess inspired by her portrait.
-
-    Y/y = golden hair, F = face, E = green eyes, N/S = nose/smile,
-    P/p = purple dress, and H = the pink bodice detail.
-    """
-    eyes = " YFFFFFY " if tick % 90 in (0, 1, 2, 3) else " YFEFEFY "
-    return [
-        "   YYY   ",
-        "  yYYYYy ",
-        " yYFFFYy ",
-        eyes,
-        " YFFNFFY ",
-        " yFFSFFy ",
-        "  pPHPp  ",
-        "  FPPPF  ",
-        "   PPP   ",
-    ]
+    return princess_pixels(tick)
 
 
 class Renderer:
     def __init__(self, win: curses.window) -> None:
         self.win = win
         self.has_colors = curses.has_colors()
+        default_bg = -1
         if self.has_colors:
             curses.start_color()
             default_bg = -1
@@ -920,6 +743,11 @@ class Renderer:
                     curses.init_pair(index, *colors)
                 except curses.error:
                     pass
+
+        self.pixels = PixelRenderer(
+            lambda y, x, text, attr: safe_add(self.win, y, x, text, attr),
+            self.has_colors, default_bg,
+        )
 
     def c(self, pair: int, bold: bool = False, dim: bool = False) -> int:
         attr = curses.color_pair(pair) if self.has_colors else 0
@@ -1003,10 +831,10 @@ class Renderer:
             " | [] |    |║                  ║|    | [] | ",
             " |    | [] |║                  ║| [] |    | ",
             " | [] |    |║                  ║|    | [] | ",
-            " |    | [] |╚══════════════════╝| [] |    | ",
-            " | [] |    |        ██        |    | [] | ",
-            " |    | [] |        ██        | [] |    | ",
-            " |____|____|________██________|____|____| ",
+            " |    | [] |║                  ║| [] |    | ",
+            " | [] |    |                  |    | [] | ",
+            " |    | [] |                  | [] |    | ",
+            " |____|____|__________________|____|____| ",
         )
         castle_width = max(map(len, castle))
         castle_x = (width - castle_width) // 2 + ox
@@ -1021,9 +849,12 @@ class Renderer:
         tangled_center = center + (3 if married else 0)
         self.draw_tangled(tangled_center, castle_y + 3, base, tick)
         if married:
-            self.draw_window_knight(game, center - 7, castle_y + 4)
+            self.draw_window_knight(game, center - 7, castle_y + 3)
             heart_center = min(width - 7, center + castle_width // 2 + 7)
             self.draw_wedding_heart(heart_center, castle_y + 3, tick)
+
+        # A stone balcony anchors both portraits above the castle wall.
+        safe_add(self.win, castle_y + 10, center - 10, "╚══════════════════╝", self.c(4, True))
 
         # Grass and roots replace the old neon grid floor.
         grass = "".join("♣" if (col + tick // 8) % 7 == 0 else "━" for col in range(width - 1))
@@ -1035,39 +866,13 @@ class Renderer:
     def draw_tangled(self, center: int, top: int, base: int, tick: int) -> None:
         sprite = tangled_sprite(tick)
         left = center - len(sprite[0]) // 2
-        glyphs = {
-            "Y": "▓",  # long golden hair
-            "y": "▒",  # golden highlights
-            "F": "█",  # bright white face and hands
-            "E": "●",  # green eyes
-            "N": "·",  # small nose
-            "S": "⌣",  # smile
-            "P": "█",  # royal purple dress
-            "p": "▓",  # striped sleeves
-            "H": "♥",  # pink bodice embroidery
-        }
-        colors = {
-            "Y": self.c(4, True),
-            "y": self.c(4),
-            "F": self.c(1, True),
-            "E": self.c(7, True),
-            "N": self.c(4, True),
-            "S": self.c(5, True),
-            "P": self.c(3, True),
-            "p": self.c(3),
-            "H": self.c(5, True),
-        }
-        for row, line in enumerate(sprite):
-            for col, code in enumerate(line):
-                if code != " ":
-                    safe_add(self.win, top + row, left + col, glyphs[code], colors[code])
-
-        # One long braid hangs from the window and sways in the breeze.
-        braid_x = left + len(sprite[0]) - 2
-        for y in range(top + 5, base):
-            sway = (y + tick // 12) % 2
-            safe_add(self.win, y, braid_x + sway, "●", self.c(4, True))
-        safe_add(self.win, base - 1, braid_x + 1, "◉", self.c(4, True))
+        self.pixels.draw(sprite, left, top, PRINCESS_MATERIALS)
+        # A narrow braid extends from the golden hair beside the gown.
+        braid_x = left + 8
+        for y in range(top + 3, base):
+            safe_add(self.win, y, braid_x, "╲" if (y + tick // 12) % 2 else "╱", self.c(4, True))
+        if base > top + 3:
+            safe_add(self.win, base - 1, braid_x, "◆", self.c(4, True))
 
     def draw_wedding_heart(self, center: int, top: int, tick: int) -> None:
         heart = (
@@ -1089,13 +894,7 @@ class Renderer:
 
     def draw_window_knight(self, game: Game, center: int, top: int) -> None:
         champion, _ = game.story_fighters()
-        sprite = (" RRR ", " MMM ", "MFOFM", "HMMMG", "H m S", " m m ", "B   B")
-        glyphs = {"R": "▓", "M": "█", "F": "▒", "O": "●", "H": "▐", "G": "◆", "S": "╱", "m": "▓", "B": "▄"}
-        colors = {"R": 5, "M": champion.color, "F": 4, "O": 1, "H": champion.color, "G": 4, "S": 1, "m": champion.color, "B": champion.color}
-        for row, line in enumerate(sprite):
-            for col, code in enumerate(line):
-                if code != " ":
-                    safe_add(self.win, top + row, center - 2 + col, glyphs[code], self.c(colors[code], True))
+        self.pixels.draw(balcony_knight_pixels(), center - 4, top, knight_materials(champion.color))
 
     def draw_hud(self, game: Game, width: int) -> None:
         bar_width = max(14, min(32, (width - 24) // 2))
@@ -1116,42 +915,10 @@ class Renderer:
     def draw_fighter(self, fighter: Fighter, ground: int, tick: int, ox: int) -> None:
         sprite = fighter_sprite(fighter, tick)
         x = round(fighter.x) - SPRITE_WIDTH // 2 + ox
-        y = ground - len(sprite) - round(fighter.jump_y / 2)
-        glyphs = {
-            "R": "▓",  # red plume
-            "M": "█",  # polished armor
-            "m": "▓",  # shadowed armor
-            "F": "▒",  # face
-            "O": "●",  # eye slit
-            "H": "▐" if fighter.facing == 1 else "▌",  # shield
-            "E": "✚",  # shield emblem
-            "S": "╱" if fighter.facing == 1 else "╲",  # blade
-            "G": "◆",  # golden guard
-            "B": "▄",  # boots
-            "A": "✦",  # arc energy
-        }
-        colors = {
-            "R": self.c(5, True),
-            "M": self.c(fighter.color, True),
-            "m": self.c(fighter.color, dim=True),
-            "F": self.c(4, True),
-            "O": self.c(1, True),
-            "H": self.c(fighter.color, True),
-            "E": self.c(5, True),
-            "S": self.c(1, True),
-            "G": self.c(4, True),
-            "B": self.c(fighter.color, dim=True),
-            "A": self.c(2 if tick % 4 < 2 else 4, True),
-        }
-        for row, line in enumerate(sprite):
-            for col, code in enumerate(line):
-                if code == " ":
-                    continue
-                attr = self.c(1, True) if fighter.flash_time > 0 else colors[code]
-                safe_add(self.win, y + row, x + col, glyphs[code], attr)
+        y = ground - (len(sprite) + 1) // 2 - round(fighter.jump_y / 2)
+        self.pixels.draw(sprite, x, y, knight_materials(fighter.color), fighter.flash_time > 0)
         if fighter.airborne:
-            shadow = "·" * 11
-            safe_add(self.win, ground - 1, x + 3, shadow, self.c(6, dim=True))
+            safe_add(self.win, ground - 1, x + 3, "·" * 11, self.c(6, dim=True))
 
     def draw_particles(self, game: Game, ground: int, ox: int) -> None:
         for p in game.particles:

@@ -4,9 +4,54 @@
 
 A fast, colorful 2D fighting game with animated, multi-color chibi knights that runs entirely inside the terminal. It uses Python's standard `curses` module, so there are no packages to install.
 
-Gameplay and terminal rendering live in `neon_dojo.py`. Interface discovery, Tailscale routes, TCP/UDP transport, protocol messages, and state synchronization live in `networking.py`.
+Gameplay and scene rendering live in `neon_dojo.py`. Original character pixel art and the half-block terminal renderer live in `sprites.py` (see [art references](ART_REFERENCES.md)). Interface discovery, Tailscale routes, TCP/UDP transport, protocol messages, and state synchronization live in `networking.py`.
 
 ## Run
+
+### Compare the three editions
+
+Run any of these files directly from your terminal:
+
+| Command | Display | Character artwork |
+|---|---|---|
+| `python3 neon_dojo_pygame.py` | Resizable pygame-ce window | PNG sheets exported from editable Aseprite sources |
+| `python3 neon_dojo_pyxel.py` | Pyxel retro game window | The same Aseprite PNG sheets, mapped to the engine palette |
+| `python3 neon_dojo_terminal.py` | Your terminal, at least 72×23 cells | PNG sheets converted to colored half-block characters |
+
+All three include single player, Add Server, Join Server, player settings, combat,
+round finishers, and the castle wedding story. The graphical editions share the
+same controller and 400×240 scene so you can compare the rendering engines.
+Both graphical versions require a desktop display; the terminal edition works
+in a terminal or SSH session. Controls are listed below.
+
+Each launcher checks its Python dependencies before loading the game. When
+something is missing or too old, it creates `.venv-variants` beside the scripts,
+installs the required packages with progress and pip logs, and automatically
+restarts itself. Later launches silently reuse the installed packages. There is
+no need to activate the environment or run pip manually. Installation needs
+internet access and a writable project directory. If setup fails, the launcher
+prints a recovery command; it does not install into system Python. On Linux,
+creating the environment may require the OS package `python3-venv`.
+
+The bundled `assets/*.aseprite` files are editable source documents. **Aseprite
+is an optional artwork editor, not a runtime dependency**: you do not need to
+buy or install it to play. The launchers use the bundled PNG/JSON exports.
+See [the asset workflow](assets/README.md) for editing and exporting from
+Aseprite. Rebuild the original artwork with `build_sprite_assets.py`; doing so
+replaces the bundled sources and exports with the original code-authored art.
+
+To preview another PNG in your terminal:
+
+```bash
+python3 png_to_terminal.py path/to/character.png --width 24
+```
+
+For finite rendering checks, each edition supports `--smoke-test`. The pygame
+edition uses SDL's dummy driver for that check; Pyxel's check still opens a
+graphical window. The terminal check validates PNG rendering without starting
+interactive curses. Use `--help` for screenshot and scene options where supported.
+
+### Original terminal edition
 
 ```bash
 python3 neon_dojo.py
@@ -36,7 +81,7 @@ Defeat your opponent in a best-of-three match. Land hits to charge the ARC meter
 
 ## Story
 
-Two knights duel in a jungle clearing beneath Tangled's castle. Tangled watches from a high window, lets down her golden hair, and calls encouragement during the fight. Her portrait uses animated terminal pixel art with golden hair, green eyes, a purple dress, and pink royal embroidery.
+Two knights duel in a jungle clearing beneath Tangled's castle. Tangled watches from a high window, lets down her golden hair, and calls encouragement during the fight. Her portrait uses animated terminal pixel art with golden hair, a white face, green eyes, a purple dress, and pink royal embroidery. Knights have shaded steel armor, team-colored tunics and shields, and distinct movement, attack, and story poses. Two pixel rows share each terminal cell to keep characters proportionate. A 256-color terminal gives the richest colors; eight-color and monochrome terminals also work.
 
 Every decisive round ends with a short, stylized **Royal Finish**: the winning knight approaches, strikes through a flash of sparks, and leaves the defeated knight's armor on the field. The sequence is theatrical and contains no gore. After the final victory, the champion crosses the clearing, climbs Tangled's hair into the castle, and joins her for the wedding finale.
 

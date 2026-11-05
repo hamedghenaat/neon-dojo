@@ -111,7 +111,9 @@ class CombatTests(unittest.TestCase):
         game.crouch(game.player)
         crouching = fighter_sprite(game.player, 0)
         self.assertEqual(game.player.action, "crouch")
-        self.assertEqual(sum(bool(line.strip()) for line in crouching), 7)
+        self.assertEqual(sum(bool(line.strip()) for line in crouching), 14)
+        self.assertTrue(all(not row.strip() for row in crouching[:4]))
+        self.assertTrue(crouching[-1].strip())
         game.player.update(0.46)
         self.assertEqual(game.player.action, "idle")
 
